@@ -4,16 +4,17 @@ from scipy.fft import fft
 import matplotlib.pyplot as mp
 from math import exp as exp
 import pywt
+from scipy import fftpack as fftpack
 
 #Variables
 deltaT = 0.01
-maxT = 450
-start = -1
-stop = 450
+maxT = 3
+start = 0
+stop = 3
 c = 1
 v0 = 0
 I = 0
-thrshld = 3
+thrshld = 1
 
 #Membrane conductances
 ena = 115
@@ -127,18 +128,23 @@ vs, time, currents = fire(v0)
 time[0] = 0
 currents[0] = 0
 
+mp.plot(time, vs, 'black')
 mp.plot(time, currents, 'r')
-mp.ylabel("Amp (V)")
-mp.xlabel("Time (s)")
-mp.suptitle("Time domain plot of current")
 mp.show()
 
-ts = [elem for elem in range(len(currents[1:]))]
+mp.plot(time, vs, 'r')
+mp.ylabel("Amp (V)")
+mp.xlabel("Time (s)")
+mp.suptitle("Time domain plot of neuron firing")
+mp.show()
+
+ts = [elem for elem in range(len(vs[1:]))]
 
 # Data formatting
-currents_mean = statistics.mean(currents) 
-signal = [((elem - currents_mean)) for elem in currents]
+vs_mean = statistics.mean(vs) 
+signal = [v - vs_mean for v in vs]
 signal = signal[1:]
+print(len(signal), '<----------------------------------------')
 
 mp.figure()
 mp.plot(ts, signal, label = "H&H Signal")
@@ -149,54 +155,171 @@ mp.legend()
 mp.show()
 
 # Decomposition
-def decompose_signal(signal, wavelet='db4', level=4):
+def decompose_signal(signal, wavelet='db4', level=5):
     '''Decompose signal into its frequency components using DWT algorithm'''
     coeffs = pywt.wavedec(signal, wavelet, level=level)
     return coeffs
 
-print(decompose_signal(signal))
-
 signal_coeffs = decompose_signal(signal)
-tss = range(0, 50)
+tss = range(len(signal_coeffs[1]))
+signal_coeffs0 = signal_coeffs[1]
+print(len(signal_coeffs0), '<----------------------------------------')
 
-mp.figure()
-mp.plot(tss, signal_coeffs[4][:len(tss)])
-# mp.plot(tss, signal_coeffs[3][:len(tss)])
-# mp.plot(tss, signal_coeffs[2][:len(tss)])
-# mp.plot(tss, signal_coeffs[1][:len(tss)])
-# mp.plot(tss, signal_coeffs[0][:len(tss)])
+mp.figure() 
+mp.plot(tss, signal_coeffs0)
 mp.xlabel('Time (s)')
 mp.ylabel("Amp (V)")
 mp.title('Decomp of H&H Signal')
 mp.show()
 
+# Feature extraction
+def filter_eeg_data(eeg_fft):
+    Amp_eeg = np.abs(eeg_fft)
+
+    sample_freq_eeg = fftpack.fftfreq(np.asarray(eeg_fft).size)
+    Amp_Freq_eeg = np.array([Amp_eeg, sample_freq_eeg])
+    Amp_pos_eeg = Amp_Freq_eeg[0,:].argmax()
+    peak_freq_eeg = Amp_Freq_eeg[1, Amp_pos_eeg]
+
+    hf_fft = eeg_fft.copy()
+    hf_fft[np.abs(sample_freq_eeg) > peak_freq_eeg] = 0
+    filtered_eeg = fftpack.ifft(hf_fft)
+
+    return filtered_eeg
+
+signal_fe = filter_eeg_data(signal_coeffs0)
+
+mp.figure()
+mp.plot(tss, signal_fe)
+mp.xlabel('Time (s)')
+mp.ylabel("Amp (V)")
+mp.title('filtered signal ceofficient 0')
+mp.show()
 
 
+# PSD of signal https://www.earthinversion.com/techniques/signal-denoising-using-fast-fourier-transform/
+def fft(signal, threshold=100):
+	'''Calculate the Fourier transform of a signal'''
+	n = len(signal)
+	fourier = np.fft.fft(signal, n)
+	psd = fourier * np.conj(fourier) / n
+	freq = (1/(deltaT*n)) * np.arange(n)
+	psd_idxs = psd < threshold
+	psd_clean = psd * psd_idxs
+	
+	return freq, psd_clean
+
+freq, psd_clean = fft(signal_fe)
+
+# print frequenct of signal_fe to check if PSD is correct
+def print_wave_frequency(signal, sampling_rate):
+	'''Print the frequency of the wave in the signal'''
+	n = len(signal)
+	fourier = np.fft.fft(signal, n)
+	freq = (1/(sampling_rate*n)) * np.arange(n)
+	max_freq_idx = np.argmax(np.abs(fourier[:n//2]))
+	wave_freq = freq[max_freq_idx]
+	print(f"The frequency of the wave is {wave_freq:.2f} Hz")
+
+print_wave_frequency(signal_fe, deltaT)
+
+mp.figure()
+mp.plot(freq, psd_clean)
+mp.xlabel('Freq (Hz)')
+mp.ylabel("Amp (V)")
+mp.title('PSD of signal ceofficient 0')
+mp.show()
+
+def create_2d_array(arr1, arr2):
+    # Check that arr1 and arr2 have the same length
+    if len(arr1) != len(arr2):
+        raise ValueError("Input arrays must have the same length")
+
+    # Combine arr1 and arr2 into a 2D NumPy array with shape (50, 2)
+    return np.column_stack((arr1, arr2))
+
+# Multi-layered perceptron/NN classifier (given the PSD of the signal and time, what would the neuron voltage look like?)
+X = np.round(np.real(create_2d_array(psd_clean[:len(psd_clean)], ts[:len(psd_clean)])), 3)
+Y = np.round(np.real(np.array(vs[:len(psd_clean)]).reshape(-1, 1)), 3)
+print(X.shape, Y.shape)
+
+class NN(object):
+	def __init__(self):
+		self.inputSize = 2
+		self.outputSize = 1
+		self.hiddenLayer = 12
+
+        # Orthogonal initialization (best method yet! error: 3.76891717) 
+		# Need to try genetic mutation method next. It also happenst to be closest to biological counterpart.
+		self.W1 = self.orthogonal_init((self.inputSize, self.hiddenLayer))
+		self.W2 = self.orthogonal_init((self.hiddenLayer, self.outputSize))
+		
+	def orthogonal_init(self, shape):
+		flat_shape = (shape[0], np.prod(shape[1:]))
+		a = np.random.normal(0.0, 1.0, flat_shape)
+		u, _, v = np.linalg.svd(a, full_matrices=False)
+		q = u if u.shape == flat_shape else v
+		return q.reshape(shape)
+
+	def cost(self, X, Y):
+		self.yH = self.fforward(X)
+		return sum((Y-self.yH)**2)*1/2
+
+	def costP(self, X, Y):
+		self.yH = self.fforward(X)
+		d3 = np.multiply(-(Y-self.yH), self.sigP(self.z3))
+		costW2 = np.dot(self.a2.T, d3)
+		d2 = np.dot(d3, self.W2.T)*self.sigP(self.z2)
+		costW1 = np.dot(X.T, d2)
+		return costW1, costW2
+
+	def sig(self, z):
+		return 1/(1+np.exp(-z))
+
+	def sigP(self, z):
+		return np.exp(-z)/((1+np.exp(-z))**2)
+
+	def fforward(self, x):
+		self.z2 = np.dot(x, self.W1)
+		self.a2 = self.sig(self.z2)
+		self.z3 = np.dot(self.a2, self.W2)
+		yH = self.sig(self.z3)
+		return yH
+
+NN = NN()
+error = []
+iteration = []
+trainSize = 1000
+for i in range(trainSize):
+	J1 = NN.cost(X, Y)
+	t = 0.1
+	costW1, costW2 = NN.costP(X, Y)
+	NN.W1 = NN.W1 - t*costW1
+	NN.W2 = NN.W2 - t*costW2
+	J2 = NN.cost(X,Y)
+	costW1, costW2 = NN.costP(X, Y)
+	NN.W1 = NN.W1 - t*costW1
+	NN.W2 = NN.W2 - t*costW2
+	J3 = NN.cost(X,Y) 
+
+	yH = NN.fforward(X)
+	error.append(J3)
+	iteration.append(i)
+	mp.plot(iteration, error, color='blue')
+	mp.pause(0.0001)
+	print(error[i])
+	if (i == trainSize):
+		break
+
+mp.show()
 
 
+mp.figure()
+mp.plot(time[:len(yH.real)], yH.real, label = "Simulated NN Neuron")
+mp.plot(time[:len(yH.real)], vs[:len(yH.real)], label = "H&H Neuron")
+mp.xlabel('time (s)')
+mp.ylabel("vs (V)")
+mp.title('first miliseconds of simulated neuron vs H&H neuron')
+mp.show()
+print(yH.real, X, Y)
 
-
-# Compute the FFT of the signal
-
-# mp.figure()
-# mp.plot(freqs, np.abs(fft_signal))
-# mp.xlabel('Frequency (Hz)')
-# mp.ylabel('Amplitude (V)')
-# mp.title('FFT of H&H Signal')
-# mp.show()
-
-# def psdCalc(signal):
-# 	N = len(signal)
-# 	xdft = fft(signal)
-# 	psdx = (1/(2*np.pi*N)) * np.abs(xdft)**2
-
-# 	return freqs/np.pi, 10*np.log(10)*psdx
-
-# psd_freqs, psd = psdCalc(signal)
-
-# mp.figure()
-# mp.plot(psd_freqs, psd)
-# mp.xlabel('Frequency (Hz)')
-# mp.ylabel('Amplitude')
-# mp.title('PSD of H&H Signal')
-# mp.show()
