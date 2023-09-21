@@ -2,6 +2,7 @@
 
 Welcome to the CogSci-Projects-Practice repository!
 This is my sandbox for testing and experimenting with various projects.
+It's where I break stuff then learn then break stuff then learn then...
 
 ## Description
 This repository serves as a playground for various cognitive science-related projects and experiments.
