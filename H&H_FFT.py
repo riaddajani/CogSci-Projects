@@ -138,13 +138,13 @@ mp.xlabel("Time (s)")
 mp.suptitle("Time domain plot of neuron firing")
 mp.show()
 
-ts = [elem for elem in range(len(vs[1:]))]
+
 
 # Data formatting
 vs_mean = statistics.mean(vs) 
 signal = [v - vs_mean for v in vs]
 signal = signal[1:]
-print(len(signal), '<----------------------------------------')
+ts = [elem for elem in range(len(vs[1:]))]
 
 mp.figure()
 mp.plot(ts, signal, label = "H&H Signal")
@@ -163,7 +163,6 @@ def decompose_signal(signal, wavelet='db4', level=5):
 signal_coeffs = decompose_signal(signal)
 tss = range(len(signal_coeffs[1]))
 signal_coeffs0 = signal_coeffs[1]
-print(len(signal_coeffs0), '<----------------------------------------')
 
 mp.figure() 
 mp.plot(tss, signal_coeffs0)
@@ -230,6 +229,7 @@ mp.ylabel("Amp (V)")
 mp.title('PSD of signal ceofficient 0')
 mp.show()
 
+# Data formatting for NN
 def create_2d_array(arr1, arr2):
     # Check that arr1 and arr2 have the same length
     if len(arr1) != len(arr2):
