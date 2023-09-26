@@ -163,14 +163,14 @@ mp.legend()
 mp.show()
 
 # Decomposition
-def decompose_signal(signal, wavelet='db1', level=2):
+def decompose_signal(signal, wavelet='db4', level=6):
     '''Decompose signal into its frequency components using DWT algorithm'''
     coeffs = pywt.wavedec(signal, wavelet, level=level)
     return coeffs
 
 signal_coeffs = decompose_signal(signal)
-ts = range(len(signal_coeffs[1]))
-signal_coeffs0 = signal_coeffs[1]
+ts = range(len(signal_coeffs[3]))
+signal_coeffs0 = signal_coeffs[3]
 
 mp.figure()
 mp.plot(ts, signal_coeffs0, 'black', label = "Decomp H&H Signal")
@@ -255,8 +255,7 @@ def create_2d_array(arr1, arr2):
         raise ValueError("Input arrays must have the same length")
     return np.column_stack((arr1, arr2))
 
-X = create_2d_array(psd_clean, freq)
-print(X)
+X = create_2d_array(signal_coeffs0, ts[:len(psd_clean)])
 
 def rescale_data(data):
     def scale_column(column):
@@ -270,22 +269,20 @@ def rescale_data(data):
     return scaled_data
 
 X = rescale_data(X)
-
-Y = np.array(vs[:len(psd_clean)]).reshape(-1, 1)
-print(Y)
-
 print(len(psd_clean))
+Y = np.array(psd_clean).reshape(-1, 1)
 
 class NN(object):
 	def __init__(self):
 		self.inputSize = 2
 		self.outputSize = 1
-		self.hiddenLayer = 12
-		self.hiddenLayer2 = 6
+		self.hiddenLayer = 20
+		# self.hiddenLayer2 = 21
 
 		self.W1 = self.he_init((self.inputSize, self.hiddenLayer))
-		self.W2 = self.he_init((self.hiddenLayer, self.hiddenLayer2))
-		self.W3 = self.he_init((self.hiddenLayer2, self.outputSize))
+		self.W2 = self.he_init((self.hiddenLayer, self.outputSize))
+		# self.W2 = self.he_init((self.hiddenLayer, self.hiddenLayer2))
+		# self.W3 = self.he_init((self.hiddenLayer2, self.outputSize))
 
 	def he_init(self, shape):
 		stddev = np.sqrt(2/shape[0])
@@ -297,13 +294,14 @@ class NN(object):
 
 	def costP(self, X, Y):
 		self.yH = self.fforward(X)
-		d4 = -(Y - self.yH)
-		costW3 = np.dot(self.a3.T, d4)
-		d3 = np.dot(d4, self.W3.T) * self.reluP(self.z3)
+		# d4 = -(Y - self.yH)
+		# costW3 = np.dot(self.a3.T, d4)
+		# d3 = np.dot(d4, self.W3.T) * self.sigP(self.z3)
+		d3 = -(Y - self.yH)
 		costW2 = np.dot(self.a2.T, d3)
 		d2 = np.dot(d3, self.W2.T) * self.reluP(self.z2)
 		costW1 = np.dot(X.T, d2)
-		return costW1, costW2, costW3
+		return costW1, costW2 #, costW3
 	
 	# ReLU activation and its derivative
 	def relu(self, z):
@@ -323,32 +321,32 @@ class NN(object):
 		self.a2 = self.relu(self.z2)
 		self.z3 = np.dot(self.a2, self.W2)
 		self.a3 = self.relu(self.z3)
-		self.z4 = np.dot(self.a3, self.W3)
-		yH = self.z4  # No activation for the output layer
+		yH = self.z3  # No activation for the output layer
+		# self.z4 = np.dot(self.a3, self.W3)
+		# yH = self.sig(self.z4)
 		return yH
-
 
 NN_relu = NN()
 error = []
 iteration = []
-trainSize = 1000
+trainSize = 100000
 for i in range(trainSize):
 	J1 = NN_relu.cost(X, Y)
-	t = 0.0001
-	costW1, costW2, costW3 = NN_relu.costP(X, Y) 
+	t = 0.001
+	costW1, costW2 = NN_relu.costP(X, Y) 
 	NN_relu.W1 = NN_relu.W1 - t * costW1
 	NN_relu.W2 = NN_relu.W2 - t * costW2
-	NN_relu.W3 = NN_relu.W3 - t * costW3 
+	# NN_relu.W3 = NN_relu.W3 - t * costW3
 	J2 = NN_relu.cost(X,Y)
-	costW1, costW2, costW3 = NN_relu.costP(X, Y)
+	costW1, costW2 = NN_relu.costP(X, Y)
 	NN_relu.W1 = NN_relu.W1 - t * costW1
 	NN_relu.W2 = NN_relu.W2 - t * costW2
-	NN_relu.W3 = NN_relu.W3 - t * costW3
+	# NN_relu.W3 = NN_relu.W3 - t * costW3
 	J3 = NN_relu.cost(X,Y)
-	
+	print(i,'/', trainSize, J3)
 	yH = NN_relu.fforward(X)
 	error.append(J3)
-	print(error[i])
+
 	iteration.append(i)
 	#print(costW3, costW2, costW1)
 	if (i == trainSize):
@@ -362,8 +360,8 @@ mp.show()
 
 # Still trying to optimize so that error == 0
 mp.figure()
-mp.plot(time[:len(yH.real)], yH.real, label = "Simulated NN Neuron")
-mp.plot(time[:len(yH.real)], vs[:len(yH.real)], linestyle='--', label = "H&H Neuron")
+mp.plot(freq, yH.real, label = "Simulated NN Neuron")
+mp.plot(freq, psd_clean, linestyle='--', label = "H&H Neuron")
 mp.xlabel('time (s)')
 mp.ylabel("vs (V)")
 mp.title('first miliseconds of simulated neuron vs H&H neuron')
