@@ -8,6 +8,7 @@ It's where I break stuff then learn then break stuff then learn then...
 
 ## Description
 This repository serves as a playground for various cognitive science-related projects and experiments.
+All original files were in python scripts but I've since moved them to notebooks.
 Dive in to explore the different Jupyter notebooks and their implementations.
 
 ## Latest Updates
