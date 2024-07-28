@@ -1,3 +1,5 @@
+(July 2024 update: this is an old repo of various cogsci stuff I worked on during my undergrad at Uwaterloo!)
+
 # CogSci-Projects-Practice
 
 Welcome to the CogSci-Projects-Practice repository!
