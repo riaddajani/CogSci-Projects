@@ -1,15 +1,8 @@
-// Headless engine checks (node): loads cards.js + the game sections with a stub UI, runs the smoke sequence and the statistical acceptance items.
+// Headless engine checks (node, no DOM): loads ../cards.js + ../game.js into a vm sandbox, runs the smoke sequence and the
+// statistical acceptance items. Run: node dev/engine.check.js
 const fs = require('fs'), vm = require('vm'), path = require('path');
-const D = __dirname, SRC = path.join(D, 'src'), GAME_DIR = path.join(D, 'synapse-league');
-const parts = ['01-core.js', '02-model.js', '03-engine.js', '04-gen.js', '05-packs.js', '06-economy.js', '07-live.js', '09-art.js'];
-const useFull = process.argv.includes('--full');
-let code = fs.readFileSync(path.join(GAME_DIR, 'cards.js'), 'utf8') + '\n';
-if (useFull) code += fs.readFileSync(path.join(GAME_DIR, 'game.js'), 'utf8');
-else {
-  code += parts.map((p) => fs.readFileSync(path.join(SRC, p), 'utf8')).join('\n');
-  code += '\nconst ui = new Proxy({}, { get: () => () => undefined });\n';
-  code += fs.readFileSync(path.join(SRC, '12-api.js'), 'utf8');
-}
+const GAME_DIR = path.join(__dirname, '..');
+const code = fs.readFileSync(path.join(GAME_DIR, 'cards.js'), 'utf8') + '\n' + fs.readFileSync(path.join(GAME_DIR, 'game.js'), 'utf8');
 const mem = {}; const localStorage = { getItem: (k) => (k in mem ? mem[k] : null), setItem: (k, v) => { mem[k] = String(v); }, removeItem: (k) => { delete mem[k]; } };
 const ctx = { console, setTimeout, clearTimeout, Date, Math, JSON, Intl, localStorage, navigator: { userAgent: 'node', hardwareConcurrency: 4, language: 'en-US' }, screen: { width: 390, height: 844 }, devicePixelRatio: 2, performance };
 ctx.window = ctx; ctx.globalThis = ctx;
@@ -181,5 +174,28 @@ G.startBattle({ rung: 2 }); r = G.autoBattle();
 ok(!r.offer && G.getLog('kill.armed').length === 0 && !G.getBattle().rig.bait, 'soft kill battle: no offer, no arming, no bait (' + r.result + ')');
 ok(G.getModel().phase === 'NORMAL' && G.getModel().session.forceInterstitial === (r.result === 'loss'), 'soft kill → NORMAL, interstitial forced on loss');
 md = G.getModel(); console.log('  phase after', md.phase, md.pendingTransition, 'kill', JSON.stringify(md.kill));
+
+console.log('== fixes: HP clamp + turn-cap tally, early close = one decline, view-safe AI, engine exposures, pendingPack settles headless');
+G.reset(); G.seed(1); G.setExperiment({ T0: 4.0, declineDelayMs: 1200, sliverPct: 0.05, postAdBoost: 1.10 }); G.skipAnims(true); G.finishOnboarding();
+{ const old = G.CONST.battle.turnCap; G.CONST.battle.turnCap = 2; G.setPhase('NORMAL');
+  G.startBattle({ player: ['sen02', 'sen03', 'sen04'], opp: ['mot09'], phase: 'NORMAL', rig: { rollBias: { player: 0, opp: 0 }, critBias: { player: -1, opp: -1 }, aiQ: 1 }, seed: 5 }); r = G.autoBattle(); if (r.offer) G.respondOffer(false); G.CONST.battle.turnCap = old;
+  const b = G.getBattle(), tally = (t) => t.reduce((a, c) => a + Math.max(0, c.hp) / c.HP_max, 0), p = tally(b.player.team), o = tally(b.opp.team);
+  ok(b.reason === 'cap' && b.result === (p >= o ? 'win' : 'loss') && b.result === 'win' && b.player.team.concat(b.opp.team).every((c) => c.hp >= 0), `turn cap (2) sen02/sen03/sen04 vs mot09 seed 5: ${b.result} by tally ${p.toFixed(3)} vs ${o.toFixed(3)}, hps ${b.player.team.map((c) => c.hp).join('/')}`); }
+{ G.setPhase('NORMAL'); G.setModel({ session: { revives: 0, rewarded: 0 } }); G.startBattle({ player: ['exe01'], opp: ['mot12'], seed: 11 }); r = G.autoBattle();
+  const m0 = G.getModel(), d0 = m0.decisions.slice(), a0 = m0.adAffinity, rev0 = m0.revenue.rewarded; G.respondOffer(true); G.fastForward(12500); G.resolveAd(false); md = G.getModel();
+  const a2 = +(0.65 * +(0.35 + 0.65 * a0).toFixed(6)).toFixed(6);
+  ok(r.offer && md.decisions.join() === d0.concat([1, 0]).join() && approx(md.adAffinity, a2, 1e-9) && md.phase === 'COOLDOWN' && md.revenue.rewarded === rev0 && G.getLog('ad.close').pop().data.method === 'early', `early-closed revive ad → decisions [${md.decisions.slice(-2).join(',')}], adAffinity ${md.adAffinity} (two-decision value ${a2}), phase ${md.phase}`); }
+{ G.setPhase('NORMAL'); G.startBattle({ player: ['mot09', 'lim06', 'exe01'], opp: ['mem01', 'mot01', 'mot03'], phase: 'NORMAL', rig: { aiQ: 1, critBias: { player: -1, opp: -1 } }, seed: 77 });
+  const E = G.engine, v = G.getBattle(), me = v.opp.active, you = v.player.active; let a, err = null; try { a = E.aiChoose(v, () => 0.99); } catch (e) { err = e.message; }
+  const ref = me.moves.map((m) => E.score(m, me, you, { turn: v.turn, playerFaster: you.SPD_eff > me.SPD_eff })), want = ref[0] >= ref[1] ? 0 : 1;
+  const w = Object.assign({}, me, { weakened: true }), m = me.moves[0], Ew = (m.power * w.ATK_eff / you.DEF_eff * 0.55 + 2) * ctx.CARD_SET.typeChart[m.sys][you.sys] * (m.sys === me.sys ? 1.2 : 1) * 0.925;
+  ok(!err && a.kind === 'move' && a.idx === want, 'engine.aiChoose(getBattle() view, rng) → argmax move ' + (err || JSON.stringify(a)));
+  ok(approx(E.expectedDamage(m, w, you), Ew, 1e-9), 'expectedDamage on a view creature applies weaken once (ATK_eff already effective)');
+  let rep = 'none'; for (let i = 0; i < 8 && G.getBattle().state !== 'END'; i++) { G.act('move', 0); const v2 = G.getBattle(); if (v2.opp.team.some((c) => c.fainted) && v2.state !== 'END') { try { rep = E.aiReplace(v2, () => 0.1); } catch (e) { rep = 'throw: ' + e.message; } break; } }
+  ok(rep === 'none' || (Number.isInteger(rep) && rep >= 0), 'engine.aiReplace(getBattle() view, rng) → ' + rep);
+  ok(typeof E.genOpponent === 'function' && E.genOpponent({ rung: 3, effTier: 2, battlesPlayed: 4 }).join() === G.genOpponent({ rung: 3, effTier: 2, battlesPlayed: 4 }).join() && approx(E.tierMult(2), 0.89, 1e-9) && approx(E.potentiationOf(3), 1.08, 1e-9) && E.cardPower(ctx.CARD_SET.cards.find((c) => c.id === 'mot09'), 2) === 286, 'engine exposes genOpponent / tierMult / potentiationOf / cardPower'); }
+{ G.autoBattle(); if (G.pendingOffer()) G.respondOffer(false); G.setModel({ session: { revives: 0, rewarded: 0 } }); G.setPhase('KILL'); G.startBattle({ rung: 2 }); G.autoBattle(); if (G.pendingOffer()) G.respondOffer(false); const ka = G.getLog('kill.armed').pop(); ok(ka && ka.data.candidates.length === 6 && ka.data.candidates.every((c) => typeof c.baitRate === 'number' && typeof c.stallRate === 'number'), 'kill.armed candidates carry baitRate/stallRate');
+  const n = G.getLog('pack.end').length, po = G.getState().packsOpened; const p = G.openPack({ free: true }); st = G.getState();
+  ok(p.cards.length === 5 && st.pendingPack === null && st.packsOpened === po + 1 && G.getLog('pack.end').length === n + 1, 'headless openPack credits and settles the pack at once (no pendingPack left)'); }
 console.log('\n' + (fails ? fails + ' FAILURES' : 'ALL OK'));
 process.exit(fails ? 1 : 0);

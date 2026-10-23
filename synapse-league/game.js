@@ -124,7 +124,7 @@ const cardPower = (card, copies) => Math.round(budgetOf(card) * potentiation(cop
 
 /* ============================================================ 4. Clock (virtual time; every timer in the game lives here) */
 const clock = (() => {
-  let offset = 0, queue = [], nextId = 1, seqNo = 0, realTimer = null, frozenAt = null;
+  let offset = 0, queue = [], nextId = 1, seqNo = 0, realTimer = null, frozenAt = null, gen = 0;
   const realNow = () => (frozenAt != null ? frozenAt : Date.now());
   const now = () => realNow() + offset;
   function arm() {
@@ -140,8 +140,8 @@ const clock = (() => {
   }
   return {
     now,
-    setTimeout(fn, ms) {
-      const it = { id: nextId++, due: now() + Math.max(0, ms || 0), seq: seqNo++, fn };
+    setTimeout(fn, ms, keep) { // keep: a UI channel (toasts) that clearAll() leaves alone
+      const it = { id: nextId++, due: now() + Math.max(0, ms || 0), seq: seqNo++, fn, keep: !!keep };
       let i = queue.length; while (i > 0 && (queue[i - 1].due > it.due)) i--;
       queue.splice(i, 0, it); arm(); return it.id;
     },
@@ -150,13 +150,22 @@ const clock = (() => {
     skipTimers() { if (queue.length) fireDue(Math.max(now(), queue[queue.length - 1].due)); },
     setNow(epoch) { offset = epoch - realNow(); arm(); },
     freeze(b) { if (b) { if (frozenAt == null) frozenAt = Date.now(); } else if (frozenAt != null) { offset += frozenAt - Date.now(); frozenAt = null; } arm(); return frozenAt != null; },
-    clearAll() { queue = []; arm(); },
+    clearAll() { gen++; queue = queue.filter((q) => q.keep); arm(); }, // game timers go; kept (toast) timers still dismiss
+    generation: () => gen,
     raf(fn) { if (hasDOM && typeof requestAnimationFrame === 'function' && !settings.skipAnims) requestAnimationFrame(fn); else fn(now()); },
     pending: () => queue.length,
   };
 })();
 const settings = { skipAnims: false };
 const dur = (ms) => (settings.skipAnims ? 0 : Math.round(ms * ((save && save.settings && save.settings.animSpeed) || 1)));
+function tween(ms, onFrame, onDone, raw) { // clock-driven progress 0→1 (rings, charges): fastForward completes it; choreography durations collapse under skipAnims, `raw` ones (ad/offer countdowns) never do
+  const d = raw ? ms : dur(ms), h = { done: false, timer: null, cancel() { h.done = true; if (h.timer != null) clock.clearTimeout(h.timer); } };
+  if (d <= 0) { onFrame(1); if (onDone) onDone(); h.done = true; return h; }
+  const start = clock.now(), g = clock.generation();
+  const finish = () => { if (h.done) return; h.done = true; onFrame(1); if (onDone) onDone(); };
+  const frame = () => { if (h.done || clock.generation() !== g) return; const p = clamp((clock.now() - start) / d, 0, 1); onFrame(p); if (p < 1 && hasDOM && typeof requestAnimationFrame === 'function') requestAnimationFrame(frame); };
+  frame(); h.timer = clock.setTimeout(finish, d); return h;
+}
 
 /* ============================================================ 5. Storage (try/catch everywhere) and the event log */
 const KEYS = { save: 'synapse.v1.save', model: 'synapse.v1.model', log: 'synapse.v1.log', prefs: 'synapse.v1.prefs' };
@@ -169,14 +178,15 @@ const storage = {
 let save = null, model = null, prefs = { v: 1, lab: false, pinned: false };
 const LOG = { v: 1, seq: 0, entries: [] };
 const logSubs = [];
-let persistTimer = null;
-function persistNow() { persistTimer = null; if (!save || !model) return; save.rng = { battle: rng.battle.calls, pack: rng.pack.calls, ui: rng.ui.calls }; storage.set(KEYS.save, save); storage.set(KEYS.model, model); storage.set(KEYS.log, LOG); storage.set(KEYS.prefs, prefs); }
-function persist() { if (persistTimer == null && typeof setTimeout === 'function') persistTimer = setTimeout(persistNow, 250); }
-function logEvent(type, data) {
+let persistTimer = null, persistHeld = false; // after a reset nothing is written until the player (or the lab) acts again: the four keys stay absent
+function persistNow() { persistTimer = null; if (!save || !model || persistHeld) return; save.rng = { battle: rng.battle.calls, pack: rng.pack.calls, ui: rng.ui.calls }; storage.set(KEYS.save, save); storage.set(KEYS.model, model); storage.set(KEYS.log, LOG); storage.set(KEYS.prefs, prefs); }
+function persist() { if (persistHeld) return; if (persistTimer == null && typeof setTimeout === 'function') persistTimer = setTimeout(persistNow, 250); }
+function persistHold() { if (persistTimer != null) { clearTimeout(persistTimer); persistTimer = null; } persistHeld = true; }
+function logEvent(type, data) { // every logged event is an action, so it releases the post-reset hold
   const e = { t: clock.now() - ((model && model.session && model.session.startedAt) || clock.now()), seq: ++LOG.seq, phase: model ? model.phase : 'ONBOARD', type, data: data || {} };
   LOG.entries.push(e); if (LOG.entries.length > CONST.log.max) LOG.entries.splice(0, LOG.entries.length - CONST.log.max);
   for (const cb of logSubs) { try { cb(e); } catch (err) { console.error(err); } }
-  persist(); return e;
+  persistHeld = false; persist(); return e;
 }
 const rng = { battle: mulberry32(1), pack: mulberry32(1), ui: mulberry32(1) };
 function seedStreams(seed, cursors) {
@@ -192,7 +202,7 @@ function freshSave(seed, now) {
     deliveryReadyAt: now + CONST.timers.deliveryMs, deliveryClaimDeadline: null,
     streak: { days: 1, lastDay: localDay(now), giftedDay: localDay(now) },
     seen: {}, firstDoubleUsed: false, onboarding: { step: 0 }, settings: { animSpeed: 1 },
-    rng: { battle: 0, pack: 0, ui: 0 }, liveBattle: null, teamPip: false, gift: null, nearFlagged: {} };
+    rng: { battle: 0, pack: 0, ui: 0 }, liveBattle: null, pendingPack: null, teamPip: false, gift: null, nearFlagged: {} };
 }
 const freshSession = (now) => ({ startedAt: now, lastInputAt: now, revives: 0, rewarded: 0, interstitials: 0, actionsSinceInterstitial: 0, lastRewardedAt: 0,
   adSeconds: 0, activeMs: 0, quitSignals: 0, offerAnswered: false, placements: {}, rapidTaps: 0, forceInterstitial: false, idleFired: false });
@@ -382,8 +392,12 @@ function makeMon(card, opts) {
   return { id: card.id, card, name: card.name, sys: card.sys, rarity: card.rarity, moves: card.moves, pot, tierMult: tm, HP_max,
     hp: opts.hp != null ? clamp(Math.round(opts.hp), 1, HP_max) : HP_max, atkBase: card.atk * pot * tm, DEF_eff: card.def * tm, SPD_eff: card.spd, weakened: false };
 }
-const ATK_eff = (m) => m.atkBase * (m.weakened ? CONST.battle.weakenMul : 1);
-const alive = (m) => m.hp > 0;
+// Creature accessors accept the engine's own objects (atkBase/DEF_eff/SPD_eff), the getBattle() view (ATK_eff already weakened) or a bare card (atk/def/spd)
+const ATK_eff = (m) => (m.atkBase != null ? m.atkBase * (m.weakened ? CONST.battle.weakenMul : 1) : m.ATK_eff != null ? m.ATK_eff : m.atk * (m.weakened ? CONST.battle.weakenMul : 1));
+const DEF_of = (m) => (m.DEF_eff != null ? m.DEF_eff : m.def);
+const SPD_of = (m) => (m.SPD_eff != null ? m.SPD_eff : m.spd);
+const activeIdxOf = (S) => (S.activeIdx != null ? S.activeIdx : S.active); // engine side: `active` is the index; view side: `activeIdx`
+const alive = (m) => m.hp > 0 && !m.fainted;
 const aliveCount = (team) => team.filter(alive).length;
 const aliveIdx = (team) => team.map((m, i) => (alive(m) ? i : -1)).filter((i) => i >= 0);
 const blog = (B, type, data) => { if (B.log) B.log(type, data); };
@@ -399,7 +413,7 @@ function createBattle(o) {
   return B;
 }
 // 3.7 AI policy — computed with FAIR expected damage; it never peeks at the player's pending choice or the rig
-function expectedDamage(m, A, D) { const cb = CONST.battle; return (m.power * ATK_eff(A) / D.DEF_eff * cb.baseMul + cb.baseAdd) * TYPE_CHART[m.sys][D.sys] * (m.sys === A.sys ? cb.stab : 1) * CONST.ai.honestRoll; }
+function expectedDamage(m, A, D) { const cb = CONST.battle; return (m.power * ATK_eff(A) / DEF_of(D) * cb.baseMul + cb.baseAdd) * TYPE_CHART[m.sys][D.sys] * (m.sys === A.sys ? cb.stab : 1) * CONST.ai.honestRoll; }
 function score(m, me, you, ctx) {
   const cb = CONST.battle, ai = CONST.ai, E = expectedDamage(m, me, you), minD = E * cb.rollMin / ai.honestRoll, maxD = E / ai.honestRoll;
   const pKO = minD >= you.hp ? 1 : maxD >= you.hp ? (maxD - you.hp) / (maxD - minD) : 0;
@@ -412,17 +426,17 @@ function score(m, me, you, ctx) {
   if (m.kw === 'recoil' && cb.recoilPct * E >= me.hp) s += ai.recoil;
   return s;
 }
-function bestMove(me, you, turn) { const ctx = { turn, youFaster: you.SPD_eff > me.SPD_eff }; const s = me.moves.map((m) => score(m, me, you, ctx)); return s[0] >= s[1] ? 0 : 1; }
+function bestMove(me, you, turn) { const ctx = { turn, youFaster: SPD_of(you) > SPD_of(me) }; const s = me.moves.map((m) => score(m, me, you, ctx)); return s[0] >= s[1] ? 0 : 1; }
 function bestReplacement(team, idxs, you) {
   let best = idxs[0];
   for (const i of idxs) { const b = team[i], c = team[best], kb = TYPE_CHART[b.sys][you.sys], kc = TYPE_CHART[c.sys][you.sys]; if (kb > kc || (kb === kc && b.hp / b.HP_max > c.hp / c.HP_max)) best = i; }
   return best;
 }
-function aiChoose(B, rngFn) {
-  const me = B.opp.team[B.opp.active], you = B.player.team[B.player.active], q = B.rig.aiQ, ai = CONST.ai;
+function aiChoose(B, rngFn) { // B: the engine battle or the getBattle() view (A-3.7.4)
+  const O = B.opp, oi = activeIdxOf(O), me = O.team[oi], you = B.player.team[activeIdxOf(B.player)], q = B.rig.aiQ, ai = CONST.ai;
   if (q >= ai.switchMinQ && TYPE_CHART[you.sys][me.sys] === 1.5) {
-    const cands = aliveIdx(B.opp.team).filter((i) => i !== B.opp.active && B.opp.team[i].hp >= 0.5 * B.opp.team[i].HP_max && TYPE_CHART[you.sys][B.opp.team[i].sys] === 0.67);
-    if (cands.length && rngFn() < ai.switchProb * q) { let best = cands[0]; for (const i of cands) if (B.opp.team[i].hp / B.opp.team[i].HP_max > B.opp.team[best].hp / B.opp.team[best].HP_max) best = i; return { kind: 'switch', idx: best }; }
+    const cands = aliveIdx(O.team).filter((i) => i !== oi && O.team[i].hp >= 0.5 * O.team[i].HP_max && TYPE_CHART[you.sys][O.team[i].sys] === 0.67);
+    if (cands.length && rngFn() < ai.switchProb * q) { let best = cands[0]; for (const i of cands) if (O.team[i].hp / O.team[i].HP_max > O.team[best].hp / O.team[best].HP_max) best = i; return { kind: 'switch', idx: best }; }
   }
   const uq = rngFn(), up = rngFn(); // always two draws (quality, pick) for determinism
   if (uq < q) return { kind: 'move', idx: bestMove(me, you, B.turn) };
@@ -431,7 +445,7 @@ function aiChoose(B, rngFn) {
 function aiReplace(B, rngFn) {
   const idxs = aliveIdx(B.opp.team); if (!idxs.length) return -1; if (idxs.length === 1) return idxs[0];
   const uq = rngFn(), up = rngFn();
-  if (uq < B.rig.aiQ) return bestReplacement(B.opp.team, idxs, B.player.team[B.player.active]);
+  if (uq < B.rig.aiQ) return bestReplacement(B.opp.team, idxs, B.player.team[activeIdxOf(B.player)]);
   return idxs[Math.floor(up * idxs.length) % idxs.length];
 }
 function policyAction(B, policy) { // player auto-policy: greedy consumes no draws, random one per decision
@@ -457,7 +471,7 @@ function executeHit(B, side, user, target, move, moveIdx, ev, rec) {
   const pCrit = clamp(cb.critBase * (1 + rig.critBias[side]), 0, cb.critMax);
   let crit = B.rng() < pCrit; const natural = crit;
   const { roll, biased } = rollDraw(B, side);
-  const base = move.power * ATK_eff(user) / target.DEF_eff * cb.baseMul + cb.baseAdd;
+  const base = move.power * ATK_eff(user) / DEF_of(target) * cb.baseMul + cb.baseAdd;
   const eff = TYPE_CHART[move.sys][target.sys], stab = move.sys === user.sys ? cb.stab : 1, sideMult = side === 'player' ? rig.sideMult : 1;
   const mult = eff * stab * roll * sideMult, dNo = Math.max(1, Math.floor(base * mult)), dCrit = Math.max(1, Math.floor(base * mult * cb.critMul));
   let forcedCrit = false;
@@ -480,17 +494,17 @@ function executeHit(B, side, user, target, move, moveIdx, ev, rec) {
   // stall (KILL only): the player's last creature is left on 1 HP so it can land the near-KO the bait then shaves
   if (rig.stall && side === 'opp' && target === P.team[P.active] && pAlive === 1 && !rig.baitFired && !rig.stallFired && dmg >= target.hp) {
     let best = 0;
-    for (const mm of target.moves) best = Math.max(best, Math.floor((mm.power * ATK_eff(target) / user.DEF_eff * cb.baseMul + cb.baseAdd) * TYPE_CHART[mm.sys][user.sys] * (mm.sys === target.sys ? cb.stab : 1) * 1.0 * rig.sideMult));
+    for (const mm of target.moves) best = Math.max(best, Math.floor((mm.power * ATK_eff(target) / DEF_of(user) * cb.baseMul + cb.baseAdd) * TYPE_CHART[mm.sys][user.sys] * (mm.sys === target.sys ? cb.stab : 1) * 1.0 * rig.sideMult));
     const need = dmg - (target.hp - 1);
     if (best >= user.hp - sliverOf(user) && need <= cb.stallCap * dmg) { dmg = target.hp - 1; stalled = need; rig.stallFired = true; blog(B, 'rig.stall', { turn: B.turn, spared: need }); }
   }
   // mercy (ONBOARD only): the tutorial's last creature cannot faint — mirror image of the bait
   if (rig.mercy && side === 'opp' && target === P.team[P.active] && pAlive === 1 && !rig.mercyFired && dmg >= target.hp) { spared = dmg - (target.hp - 1); dmg = target.hp - 1; rig.mercyFired = true; blog(B, 'rig.mercy', { turn: B.turn, spared }); }
-  target.hp -= dmg;
+  target.hp = Math.max(0, target.hp - dmg); // HP never goes negative: fainted creatures read 0 everywhere (bars, views, the turn-cap tally)
   if (side === 'player' && sideMult !== 1) { B.stats.sideMultHits++; blog(B, 'battle.rig', { knob: 'sideMult', mult: sideMult, turn: B.turn }); } // inflated post-ad damage
   let drained = 0, recoil = 0, weakened = false;
   if (move.kw === 'drain') { drained = Math.min(user.HP_max - user.hp, Math.floor(cb.drainPct * dmg)); user.hp += drained; }
-  if (move.kw === 'recoil') { recoil = Math.min(user.hp, Math.floor(cb.recoilPct * dmg)); user.hp -= recoil; }
+  if (move.kw === 'recoil') { recoil = Math.min(user.hp, Math.floor(cb.recoilPct * dmg)); user.hp = Math.max(0, user.hp - recoil); }
   if (move.kw === 'weaken' && target.hp > 0) { weakened = !target.weakened; target.weakened = true; }
   if (crit) { B.stats.crits[side][forcedCrit ? 'forced' : 'natural']++; if (side === 'opp') B.stats.oppCrits++; }
   const fainted = target.hp <= 0, userFainted = user.hp <= 0;
@@ -541,7 +555,7 @@ function finishTurn(B, ev, rec) {
   if (!oAlive) return endBattle(B, 'win', pAlive ? 'faint' : 'doubleKO', ev); // opponent checked first; a double KO is a player win
   if (!pAlive) return endBattle(B, 'loss', 'faint', ev);
   B.turn++;
-  if (B.turn > CONST.battle.turnCap) { const hp = (t) => sum(t.map((m) => m.hp / m.HP_max)); return endBattle(B, hp(B.player.team) >= hp(B.opp.team) ? 'win' : 'loss', 'cap', ev); }
+  if (B.turn > CONST.battle.turnCap) { const hp = (t) => sum(t.map((m) => Math.max(0, m.hp) / m.HP_max)); return endBattle(B, hp(B.player.team) >= hp(B.opp.team) ? 'win' : 'loss', 'cap', ev); } // Σ max(0, hp)/HP_max per side
   B.state = 'CHOOSE';
 }
 function runHeadless(B, policy) {
@@ -558,7 +572,7 @@ function battleStats(B) {
 const monView = (m, i) => ({ id: m.id, name: m.name, sys: m.sys, rarity: m.rarity, hp: Math.max(0, m.hp), HP_max: m.HP_max, weakened: m.weakened, fainted: !alive(m), teamIdx: i, ATK_eff: +ATK_eff(m).toFixed(3), DEF_eff: +m.DEF_eff.toFixed(3), SPD_eff: m.SPD_eff, tierMult: m.tierMult, pot: m.pot, moves: m.moves });
 function sideView(S) { return { active: monView(S.team[S.active], S.active), activeIdx: S.active, bench: S.team.map(monView).filter((v) => v.teamIdx !== S.active), team: S.team.map(monView) }; }
 function battleView(B) { return { id: B.id, turn: B.turn, state: B.state, rig: deepClone(B.rig), player: sideView(B.player), opp: sideView(B.opp), rolls: B.rolls.slice(), actions: deepClone(B.actions), turns: deepClone(B.turns), seed: B.seed, result: B.result, reason: B.reason, rung: B.rung, effTier: B.effTier, revived: B.revived }; }
-const engine = { expectedDamage, score, aiChoose, aiReplace, makeMon, createBattle, resolveTurn, sendReplacement, runHeadless, fairRig, battleStats };
+const engine = { expectedDamage, score, aiChoose, aiReplace, bestMove, makeMon, createBattle, resolveTurn, sendReplacement, runHeadless, fairRig, battleStats, tierMult, potentiationOf: potentiation, cardPower, rarityWeights };
 
 /* ============================================================ 8. Opponent generation (§3.8, A-3.8.3): deterministic per (seed, rung, effTier, battlesPlayed, candidate) */
 function genOpponent(o) {
@@ -631,7 +645,7 @@ function armKill(rung, teamCards, battleSeed) {
   Object.assign(m.kill, { base, effTier: chosen.effTier, candidate: chosen.candidate, lossRate: chosen.lossRate, nearMissRate: chosen.nearMissRate, reviveWinRate: chosen.reviveWinRate, fallback: !ok.length });
   logEvent('kill.armed', { base, rung, chosen: { effTier: chosen.effTier, candidate: chosen.candidate }, lossRate: chosen.lossRate, nearMissRate: chosen.nearMissRate, sliverRate: chosen.sliverRate,
     baitRate: chosen.baitRate, stallRate: chosen.stallRate, reviveWinRate: chosen.reviveWinRate, meanTurns: chosen.meanTurns, fallback: !ok.length,
-    candidates: cands.map((c) => ({ effTier: c.effTier, candidate: c.candidate, lossRate: c.lossRate, nearMissRate: c.nearMissRate, reviveWinRate: c.reviveWinRate, ids: c.ids })) });
+    candidates: cands.map((c) => ({ effTier: c.effTier, candidate: c.candidate, offset: c.offset, lossRate: c.lossRate, nearMissRate: c.nearMissRate, sliverRate: c.sliverRate, baitRate: c.baitRate, stallRate: c.stallRate, reviveWinRate: c.reviveWinRate, meanTurns: c.meanTurns, ids: c.ids })) });
   return { effTier: chosen.effTier, candidate: chosen.candidate, oppCards: chosen.ids.map((id) => BYID[id]) };
 }
 // Lab "Rehearse ×n": the next battle's rig (or a given fixture) against the current team
@@ -732,9 +746,11 @@ function packSentence(lp) {
   return `${lp.row}: R/H/L odds ×${lp.rig.oddsMul}; ${nDup} of ${nCU} commons were forced duplicates; ${lp.rig.excludeNeeded && lp.needed ? BYID[lp.needed].name : 'nothing'} was excluded; slot ${slots.length} ${five}.`;
 }
 const packs = {
-  // The whole pipeline for one pack: cost → profile → pity → draw → grant → F/counters → transition. Returns the result for the UI.
+  // The pipeline for one pack is split in two: open() = cost → profile → pity → draw → collection credit (persisted as save.pendingPack);
+  // apply() = counters → F terms → pack.end → transition, run when the Summary shows (or at once for instant/headless opens, or on the
+  // boot after a reload mid-reveal). A pack is therefore never lost and never counted twice.
   open(type, opts) {
-    opts = opts || {}; type = type || 'standard'; const m = model, prof = packProfileFor(type);
+    opts = opts || {}; type = type || 'standard'; this.applyPending(); const m = model, prof = packProfileFor(type);
     let cost = 0;
     if (type === 'standard' && !opts.free) { if (save.coins < CONST.coins.packCost) return { error: 'coins' }; cost = CONST.coins.packCost; save.coins -= cost; }
     consumeOfferAnswered('pack.open');
@@ -746,29 +762,37 @@ const packs = {
     const slots = type === 'starter' ? STARTER.map((id, i) => ({ slot: i + 1, rolledRarity: BYID[id].rarity, finalRarity: BYID[id].rarity, reason: 'starter', id }))
       : drawPack(Object.assign({}, prof, { pity, bait }), { rngFn: rng.pack, collection: save.collection, forcedStreak });
     if (prof.droughtCapped) logEvent('pack.rig', { reason: 'droughtCap', droughtPacks: m.kill.droughtPacks });
-    if (prof.row === 'KILL' && type === 'standard') { m.kill.droughtPacks++; if (bait) m.kill.baitPackDone = true; }
+    if (prof.row === 'KILL' && type === 'standard') { m.kill.droughtPacks++; if (bait) m.kill.baitPackDone = true; } // decided with the draw: it shapes the next pack's profile
     const cards = slots.map((s) => BYID[s.id]);
     const badges = cards.map((c) => { const had = save.collection[c.id] || 0; save.collection[c.id] = had + 1; return { id: c.id, isNew: had === 0, copies: had + 1, ltp: had > 0 ? potentiation(had + 1) : null }; });
     const baitInfo = bait ? { kind: prof.baitKind, shown: prof.baitKind === 'binder' ? prof.needed : 'Holo', actual: slots[slots.length - 1].id } : null;
     if (bait) logEvent('bait.fire', { kind: 'pack', shown: baitInfo.shown, actual: baitInfo.actual, binderKind: prof.baitKind });
-    save.packsOpened++;
-    const rarePlus = cards.filter(isRarePlus).length, newCount = badges.filter((b) => b.isNew).length, onboardPack = type === 'starter' || type === 'onboard2';
-    if (!onboardPack) {
-      save.packsSinceRarePlus = rarePlus ? 0 : save.packsSinceRarePlus + 1;
-      if (!rarePlus) addF('pack.noRare', CONST.patience.dF.packNoRare); if (!newCount) addF('pack.allDup', CONST.patience.dF.packAllDup); if (bait) addF('pack.bait', CONST.patience.dF.packBait);
-      for (let i = 0; i < rarePlus; i++) addF('pack.rarePlus', CONST.patience.dF.rarePlus);
-      for (let i = 0; i < newCount; i++) addF('pack.newCard', CONST.patience.dF.newCard);
-    }
     m.lastPack = { type, phase: m.phase, row: prof.row, rig: { oddsMul: prof.oddsMul, dupBias: prof.dupBias, excludeNeeded: prof.excludeNeeded, forced5: pity ? 'pity' : forcedStreak ? 'streak:' + forcedStreak : prof.forced5, bait, droughtCapped: prof.droughtCapped },
       slots, bait: baitInfo, pity, needed: prof.needed, packsSincePity: save.packsSincePity };
     m.lastPack.sentence = packSentence(m.lastPack);
-    logEvent('pack.end', { type, ids: slots.map((s) => s.id), rarePlus, newCount, bait, pity, cost });
+    save.pendingPack = { type, slots, badges, bait: baitInfo, pity, cost, rig: m.lastPack.rig, sentence: m.lastPack.sentence };
+    persist();
+    return this.result(save.pendingPack);
+  },
+  result(p) { const cards = p.slots.map((s) => BYID[s.id]); return { type: p.type, cards, slots: p.slots, badges: p.badges, rig: p.rig, bait: p.bait, pity: p.pity, rarePlus: cards.filter(isRarePlus).length, newCount: p.badges.filter((b) => b.isNew).length, sentence: p.sentence }; },
+  apply(r) { // finishes the pending pack's bookkeeping exactly once; `r` (optional) must be that pack
+    const p = save.pendingPack; if (!p) return false;
+    if (r && r.slots !== p.slots && r.slots.map((s) => s.id).join() !== p.slots.map((s) => s.id).join()) return false;
+    const m = model, cards = p.slots.map((s) => BYID[s.id]), rarePlus = cards.filter(isRarePlus).length, newCount = p.badges.filter((b) => b.isNew).length, onboardPack = p.type === 'starter' || p.type === 'onboard2';
+    save.pendingPack = null; save.packsOpened++;
+    if (!onboardPack) {
+      save.packsSinceRarePlus = rarePlus ? 0 : save.packsSinceRarePlus + 1;
+      if (!rarePlus) addF('pack.noRare', CONST.patience.dF.packNoRare); if (!newCount) addF('pack.allDup', CONST.patience.dF.packAllDup); if (p.bait) addF('pack.bait', CONST.patience.dF.packBait);
+      for (let i = 0; i < rarePlus; i++) addF('pack.rarePlus', CONST.patience.dF.rarePlus);
+      for (let i = 0; i < newCount; i++) addF('pack.newCard', CONST.patience.dF.newCard);
+    }
+    logEvent('pack.end', { type: p.type, ids: p.slots.map((s) => s.id), rarePlus, newCount, bait: !!p.bait, pity: p.pity, cost: p.cost });
     m.phasePacks++;
     if (m.phase === 'REWARD' && !onboardPack) { if (m.reward.packsLeft > 0) m.reward.packsLeft--; m.reward.actions = Math.max(0, m.reward.actions - 1); }
     if (!onboardPack) { m.session.actionsSinceInterstitial++; evaluateTransition('pack.end'); }
-    binder.checkNearComplete(); recompute(); persist();
-    return { type, cards, slots, badges, rig: m.lastPack.rig, bait: baitInfo, pity, rarePlus, newCount, sentence: m.lastPack.sentence };
+    binder.checkNearComplete(); recompute(); persist(); return true;
   },
+  applyPending() { return this.apply(null); },
   // Re-roll the duplicate last card after a bait pack (rewarded placement 5): Rare+ forced, the needed card dangled at 25%
   reroll(fromId) {
     const had = save.collection[fromId] || 0; if (had <= 1) delete save.collection[fromId]; else save.collection[fromId] = had - 1;
@@ -894,6 +918,8 @@ function benchToTeam(B, arg) {
 }
 function startBattle(opts) {
   opts = opts || {}; const m = model;
+  if (LIVE && LIVE.offerPending) offers.autoDecline('abandoned'); // a revive left unanswered by a restart is a silent decline (no segment decision)
+  offers.dismissPending(); // a Double sheet or a pill never outlives the screen it was offered on
   if (LIVE && LIVE.B.state !== 'END' && !LIVE.finalized) abandonBattle(LIVE, 'restart');
   const phase = opts.phase || (m.phase === 'OFFER' ? 'NORMAL' : m.phase), tutorial = phase === 'ONBOARD';
   const rung = clamp(opts.rung || (tutorial ? 1 : save.ladder.nextRung), 1, 12);
@@ -1010,10 +1036,14 @@ function reviveTeam(L) { // REVIVE: the whole team at full HP, the rival keeps i
   enterPhase('REWARD', 'offer.accept');
   if (!L.headless) ui.reviveScene(L); persist();
 }
-function declineRevive(L, reason, reactionMs) {
+function declineRevive(L, reason, reactionMs) { // reason: decline | early (ad closed early) | quit | abandoned
   const m = model; L.offerPending = false; L.offer = null; m.declinesTotal++; m.session.offerAnswered = true;
   if (reason === 'quit') { logEvent('offer.decline', { placement: 'revive', reason: 'quit' }); finalizeBattle(L, { noTransition: true }); }
-  else { logEvent('offer.decline', { placement: 'revive', reason, reactionMs }); recordDecision(false, 'revive'); if (reason !== 'early' && reactionMs < CONST.patience.fastDeclineMs) setT(m.T - CONST.patience.fastDeclineT, 'fastDecline'); finalizeBattle(L, { reason: 'offer.' + reason }); }
+  else if (reason === 'abandoned') { logEvent('offer.decline', { placement: 'revive', reason }); finalizeBattle(L, { reason: 'offer.abandoned' }); }
+  else { // 'early' is already the one decline recorded by ads.resolve(false): accept → [A], early close → [A, D]
+    logEvent('offer.decline', { placement: 'revive', reason, reactionMs }); if (reason !== 'early') recordDecision(false, 'revive');
+    if (reason !== 'early' && reactionMs < CONST.patience.fastDeclineMs) setT(m.T - CONST.patience.fastDeclineT, 'fastDecline'); finalizeBattle(L, { reason: 'offer.' + reason });
+  }
   if (!L.headless) ui.showDefeat(L);
 }
 function resumeLiveBattleOnBoot() { // A-3.10.4: a battle that was open when the page closed is abandoned as a forfeit (the tutorial restarts instead)
@@ -1062,6 +1092,7 @@ const offers = {
     return true;
   },
   showRevive(L) {
+    this.dismissPending(); // the revive sheet supersedes any secondary offer still pending (its late decline button must not land here)
     const m = model, B = L.B, st = battleStats(B), oa = B.opp.team[B.opp.active], special = st.oppActivePct <= CONST.battle.nearMissPct;
     enterPhase('OFFER', special ? 'near-miss loss: special revive' : 'loss: standard revive');
     m.session.revives++;
@@ -1081,9 +1112,9 @@ const offers = {
   },
   clear(p) { for (const t of p.timers) clock.clearTimeout(t); if (this.pending === p) this.pending = null; if (!p.standing) ui.offerHide(p); },
   expire(p) { this.clear(p); logEvent('offer.decline', { placement: p.placement, reason: 'expired' }); }, // not a segment decision
-  dismissPending() { // leaving the screen an offer lives on: the double expires, any other secondary placement is dismissed (never a segment decision); the revive is never dismissed here
-    const p = this.pending; if (!p || p.placement === 'revive') return;
-    this.clear(p); logEvent('offer.decline', { placement: p.placement, reason: p.placement === 'double' ? 'expired' : 'dismissed' });
+  dismissPending() { // a secondary placement does not survive a screen change, a battle start or the revive sheet: dismissed, never a segment decision; the revive is never dismissed here
+    const p = this.pending; if (!p || p.placement === 'revive') return false;
+    this.clear(p); logEvent('offer.decline', { placement: p.placement, reason: 'dismissed' }); return true;
   },
   respond(accept) {
     const p = this.pending; if (!p) return false; const m = model, reactionMs = clock.now() - p.shownAt; this.clear(p);
@@ -1183,22 +1214,23 @@ const sysColor = (s) => SYSTEMS[s].color;
 function darken(hex, f) { const n = parseInt(hex.slice(1), 16); const c = [n >> 16, (n >> 8) & 255, n & 255].map((v) => Math.round(v * (1 - f))); return '#' + c.map((v) => v.toString(16).padStart(2, '0')).join(''); }
 const RARITY_FRAME = { C: '#94a3b8', U: '#4ade80', R: '#93c5fd', H: '#ffffff', L: '#fbbf24' };
 const f1 = (x) => +x.toFixed(1);
-function renderGlyph(card) { // shared 200×200 group, byte-identical in cards and sprites (A-5.1)
+function renderGlyph(card) { // shared 200×200 group, byte-identical in cards and sprites (A-5.1); every element carries each attribute once (valid XML)
   const r = mulberry32(card.seed), col = sysColor(card.sys), rnd = (a, b) => a + r() * (b - a), ri = (a, b) => Math.floor(rnd(a, b + 1));
-  const S = `stroke="rgba(255,255,255,0.85)" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"`, F = `fill="${col}" fill-opacity="0.25"`;
+  const sk = (w) => `stroke="rgba(255,255,255,0.85)" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round"`, SK = sk(2.2);
+  const S = `fill="none" ${SK}`, FS = `fill="${col}" fill-opacity="0.25" ${SK}`; // stroked outline · filled and stroked
   let g = '';
   switch (card.kind) {
     case 'Neuron': {
       const sr = rnd(22, 30), n = ri(5, 9);
       for (let i = 0; i < n; i++) { let a = (i / n) * Math.PI * 2 + rnd(-0.3, 0.3), x = 100 + Math.cos(a) * sr, y = 100 + Math.sin(a) * sr, pts = [[x, y]]; for (let k = 0; k < 5; k++) { a += rnd(-0.61, 0.61); const len = rnd(12, 20); x += Math.cos(a) * len; y += Math.sin(a) * len; pts.push([x, y]); } g += `<polyline points="${pts.map((p) => f1(p[0]) + ',' + f1(p[1])).join(' ')}" ${S}/>`; }
       g += `<line x1="100" y1="${f1(100 + sr)}" x2="100" y2="190" ${S}/>`;
-      const beads = ri(3, 5); for (let i = 0; i < beads; i++) { const y = 100 + sr + 12 + i * ((70 - sr / 2) / beads); g += `<ellipse cx="100" cy="${f1(y)}" rx="7" ry="4.5" ${F} ${S}/>`; }
-      g += `<circle cx="100" cy="100" r="${f1(sr)}" ${F} ${S}/>`; break;
+      const beads = ri(3, 5); for (let i = 0; i < beads; i++) { const y = 100 + sr + 12 + i * ((70 - sr / 2) / beads); g += `<ellipse cx="100" cy="${f1(y)}" rx="7" ry="4.5" ${FS}/>`; }
+      g += `<circle cx="100" cy="100" r="${f1(sr)}" ${FS}/>`; break;
     }
     case 'Region': {
       const n = ri(8, 12), pts = []; for (let i = 0; i < n; i++) { const a = (i / n) * Math.PI * 2, rr = rnd(55, 80); pts.push([100 + Math.cos(a) * rr, 100 + Math.sin(a) * rr]); }
       let d = ''; for (let i = 0; i < n; i++) { const p0 = pts[(i - 1 + n) % n], p1 = pts[i], p2 = pts[(i + 1) % n], p3 = pts[(i + 2) % n]; const c1 = [p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6], c2 = [p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6]; d += (i === 0 ? `M${f1(p1[0])},${f1(p1[1])}` : '') + `C${f1(c1[0])},${f1(c1[1])} ${f1(c2[0])},${f1(c2[1])} ${f1(p2[0])},${f1(p2[1])}`; }
-      g += `<path d="${d}Z" ${F} ${S}/>`;
+      g += `<path d="${d}Z" ${FS}/>`;
       const sulci = ri(3, 5); for (let i = 0; i < sulci; i++) { const x = rnd(65, 135), y = rnd(65, 135), a = rnd(0, Math.PI), l = rnd(14, 26); g += `<path d="M${f1(x - Math.cos(a) * l)},${f1(y - Math.sin(a) * l)} Q${f1(x + Math.sin(a) * 10)},${f1(y - Math.cos(a) * 10)} ${f1(x + Math.cos(a) * l)},${f1(y + Math.sin(a) * l)}" ${S}/>`; }
       break;
     }
@@ -1206,24 +1238,24 @@ function renderGlyph(card) { // shared 200×200 group, byte-identical in cards a
       const n = ri(6, 10), nodes = [], solid = ri(0, n - 1); let cx = 100, cy = 100;
       for (let i = 0; i < n; i++) { nodes.push([cx, cy]); const a = ri(0, 5) * Math.PI / 3; cx = clamp(cx + Math.cos(a) * 30, 25, 175); cy = clamp(cy + Math.sin(a) * 30, 25, 175); }
       for (let i = 1; i < n; i++) g += `<line x1="${f1(nodes[i - 1][0])}" y1="${f1(nodes[i - 1][1])}" x2="${f1(nodes[i][0])}" y2="${f1(nodes[i][1])}" ${S}/>`;
-      nodes.forEach((p, i) => { g += `<circle cx="${f1(p[0])}" cy="${f1(p[1])}" r="6" ${i === solid ? `fill="${col}"` : F} ${S}/>`; }); break;
+      nodes.forEach((p, i) => { g += `<circle cx="${f1(p[0])}" cy="${f1(p[1])}" r="6" ${i === solid ? `fill="${col}" ${SK}` : FS}/>`; }); break;
     }
     case 'Bias': {
       const ox = rnd(-28, 28), oy = rnd(-14, 14) * (Math.abs(ox) < 10 ? 1.5 : 1);
-      g += `<ellipse cx="100" cy="100" rx="60" ry="35" ${F} ${S}/><circle cx="${f1(100 + ox)}" cy="${f1(100 + oy * 0.6)}" r="13" fill="${col}" fill-opacity="0.6" ${S}/><circle cx="${f1(100 + ox + 4)}" cy="${f1(96 + oy * 0.6)}" r="3" fill="rgba(255,255,255,0.9)"/>`;
+      g += `<ellipse cx="100" cy="100" rx="60" ry="35" ${FS}/><circle cx="${f1(100 + ox)}" cy="${f1(100 + oy * 0.6)}" r="13" fill="${col}" fill-opacity="0.6" ${SK}/><circle cx="${f1(100 + ox + 4)}" cy="${f1(96 + oy * 0.6)}" r="3" fill="rgba(255,255,255,0.9)"/>`;
       const a1 = rnd(0.3, 1.2), a2 = a1 + rnd(1.6, 2.8); [a1, a2].forEach((a) => { const x1 = 100 + Math.cos(a) * 42, y1 = 100 + Math.sin(a) * 42, x2 = 100 + Math.cos(a) * 82, y2 = 100 + Math.sin(a) * 82; g += `<line x1="${f1(x1)}" y1="${f1(y1)}" x2="${f1(x2)}" y2="${f1(y2)}" ${S}/><polyline points="${f1(x2 - Math.cos(a - 0.5) * 9)},${f1(y2 - Math.sin(a - 0.5) * 9)} ${f1(x2)},${f1(y2)} ${f1(x2 - Math.cos(a + 0.5) * 9)},${f1(y2 - Math.sin(a + 0.5) * 9)}" ${S}/>`; });
       break;
     }
     case 'Illusion': {
       if (card.seed % 2 === 0) { const off = rnd(4, 14); for (let row = 0; row < 7; row++) { const y = 30 + row * 20, sh = (row % 2) * off; for (let c = -1; c < 5; c++) { const x = 30 + c * 32 + sh; if (x + 28 > 28 && x < 172) g += `<rect x="${f1(Math.max(28, x))}" y="${y}" width="${f1(Math.min(172, x + 28) - Math.max(28, x))}" height="16" ${c % 2 ? `fill="${col}" fill-opacity="0.35"` : 'fill="rgba(255,255,255,0.75)"'}/>`; } g += `<line x1="28" y1="${y + 18}" x2="172" y2="${y + 18}" stroke="rgba(255,255,255,0.5)" stroke-width="1"/>`; } }
-      else { const skew = rnd(0.05, 0.25); for (let i = 1; i <= 12; i++) { const rr = i * 6.5, a = i * skew; g += `<ellipse cx="100" cy="100" rx="${f1(rr)}" ry="${f1(rr * 0.9)}" transform="rotate(${f1(a * 57.3)} 100 100)" ${S} stroke-width="1.6"/>`; } g += `<circle cx="100" cy="100" r="8" fill="${col}" fill-opacity="0.6"/>`; }
+      else { const skew = rnd(0.05, 0.25); for (let i = 1; i <= 12; i++) { const rr = i * 6.5, a = i * skew; g += `<ellipse cx="100" cy="100" rx="${f1(rr)}" ry="${f1(rr * 0.9)}" transform="rotate(${f1(a * 57.3)} 100 100)" fill="none" ${sk(1.6)}/>`; } g += `<circle cx="100" cy="100" r="8" fill="${col}" fill-opacity="0.6"/>`; }
       break;
     }
     default: { // Experiment: box, lever, lamp, beaker
       const bx = rnd(28, 40), by = rnd(60, 75), lx = rnd(120, 140), lit = card.seed % 3 !== 0;
-      g += `<rect x="${f1(bx)}" y="${f1(by)}" width="88" height="70" rx="8" ${F} ${S}/><line x1="${f1(bx + 20)}" y1="${f1(by + 50)}" x2="${f1(bx + 44)}" y2="${f1(by + 26)}" ${S} stroke-width="3"/><circle cx="${f1(bx + 44)}" cy="${f1(by + 24)}" r="4" fill="rgba(255,255,255,0.9)"/>`;
-      g += `<circle cx="${f1(bx + 70)}" cy="${f1(by + 16)}" r="7" fill="${lit ? col : 'rgba(255,255,255,0.2)'}" ${S}/>`;
-      g += `<path d="M${f1(lx)},${f1(by - 10)} v34 l-9 30 q-3 10 7 10 h22 q10 0 7 -10 l-9 -30 v-34 Z" ${F} ${S}/><rect x="${f1(lx - 2)}" y="${f1(by + 30)}" width="34" height="22" rx="4" fill="${col}" fill-opacity="0.45"/>`;
+      g += `<rect x="${f1(bx)}" y="${f1(by)}" width="88" height="70" rx="8" ${FS}/><line x1="${f1(bx + 20)}" y1="${f1(by + 50)}" x2="${f1(bx + 44)}" y2="${f1(by + 26)}" fill="none" ${sk(3)}/><circle cx="${f1(bx + 44)}" cy="${f1(by + 24)}" r="4" fill="rgba(255,255,255,0.9)"/>`;
+      g += `<circle cx="${f1(bx + 70)}" cy="${f1(by + 16)}" r="7" fill="${lit ? col : 'rgba(255,255,255,0.2)'}" ${SK}/>`;
+      g += `<path d="M${f1(lx)},${f1(by - 10)} v34 l-9 30 q-3 10 7 10 h22 q10 0 7 -10 l-9 -30 v-34 Z" ${FS}/><rect x="${f1(lx - 2)}" y="${f1(by + 30)}" width="34" height="22" rx="4" fill="${col}" fill-opacity="0.45"/>`;
     }
   }
   return `<g class="glyph"><title>${esc(card.motif)}</title>${g}</g>`;
@@ -1255,10 +1287,13 @@ function renderPortrait(rival, uidSuffix) {
   const leg = grey ? null : CARDS.find((c) => c.sys === rival.specialty && c.rarity === 'L');
   return `<svg class="portrait" viewBox="0 0 96 96" width="96" height="96" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${esc(rival.name)}"><defs><linearGradient id="${uid}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${col}"/><stop offset="1" stop-color="${darken(col, 0.45)}"/></linearGradient><clipPath id="${uid}c"><circle cx="48" cy="48" r="46"/></clipPath></defs><circle cx="48" cy="48" r="46" fill="url(#${uid})"/>${leg ? `<g clip-path="url(#${uid}c)" transform="translate(26,26) scale(0.34)" opacity="0.5">${renderGlyph(leg)}</g>` : ''}<text x="48" y="58" text-anchor="middle" font-size="30" font-weight="800" fill="#0b0f1a" font-family="system-ui, sans-serif">${esc(rival.initials)}</text></svg>`;
 }
-function renderPoster(adv, big) { // fictional advertiser: wordmark, tagline, three seeded shapes, a "Learn more" button
-  const r = mulberry32(fnv1a32(adv.key)), col = sysColor(adv.accent); let shapes = '';
-  for (let i = 0; i < 3; i++) { const x = 20 + r() * 240, y = 20 + r() * 120, s = 20 + r() * 50, k = Math.floor(r() * 3); shapes += k === 0 ? `<circle cx="${f1(x)}" cy="${f1(y)}" r="${f1(s / 2)}" fill="${col}" fill-opacity="0.55"/>` : k === 1 ? `<rect x="${f1(x)}" y="${f1(y)}" width="${f1(s)}" height="${f1(s * 0.7)}" rx="6" fill="${col}" fill-opacity="0.45" transform="rotate(${f1(r() * 40 - 20)} ${f1(x)} ${f1(y)})"/>` : `<polygon points="${f1(x)},${f1(y)} ${f1(x + s)},${f1(y + s / 3)} ${f1(x + s / 3)},${f1(y + s)}" fill="${col}" fill-opacity="0.5"/>`; }
-  return `<div class="poster ${big ? 'big' : ''}" style="--accent:${col}"><svg viewBox="0 0 300 160" preserveAspectRatio="xMidYMid slice" aria-hidden="true">${shapes}</svg><div class="poster-text"><div class="wordmark">${esc(adv.wordmark)}</div><div class="tagline">${esc(adv.tagline)}</div>${big ? '<button class="learn" data-act="ad-learn">Learn more</button>' : ''}</div></div>`;
+function renderPoster(adv, big) { // fictional advertiser: wordmark, tagline, three seeded shapes (one circle, one rounded rect, one triangle, all inside the box), a "Learn more" button
+  const r = mulberry32(fnv1a32(adv.key)), col = sysColor(adv.accent), k0 = Math.floor(r() * 3); let shapes = '';
+  for (let i = 0; i < 3; i++) {
+    const x = 50 + r() * 200, y = 40 + r() * 80, s = 28 + r() * 32, k = (k0 + i) % 3, rot = f1(r() * 40 - 20);
+    shapes += k === 0 ? `<circle cx="${f1(x)}" cy="${f1(y)}" r="${f1(s / 2)}" fill="${col}" fill-opacity="0.55"/>` : k === 1 ? `<rect x="${f1(x - s / 2)}" y="${f1(y - s * 0.35)}" width="${f1(s)}" height="${f1(s * 0.7)}" rx="6" fill="${col}" fill-opacity="0.45" transform="rotate(${rot} ${f1(x)} ${f1(y)})"/>` : `<polygon points="${f1(x)},${f1(y - s / 2)} ${f1(x + s / 2)},${f1(y + s / 2)} ${f1(x - s / 2)},${f1(y + s / 2)}" fill="${col}" fill-opacity="0.5"/>`;
+  }
+  return `<div class="poster ${big ? 'big' : ''}" style="--accent:${col}"><svg viewBox="0 0 300 160" preserveAspectRatio="xMidYMid meet" aria-hidden="true">${shapes}</svg><div class="poster-text"><div class="wordmark">${esc(adv.wordmark)}</div><div class="tagline">${esc(adv.tagline)}</div>${big ? '<button class="learn" data-act="ad-learn">Learn more</button>' : ''}</div></div>`;
 }
 
 /* ============================================================ 14. UI (§7): screens, sheets, pills, ads, toasts, dialogs, input tracking. All DOM work lives here. */
@@ -1278,9 +1313,9 @@ function cardHtml(card, o) {
 const miniCard = (card, o) => cardHtml(card, Object.assign({ size: 'mini' }, o));
 function ring(pct, size, label) { const r = (size - 6) / 2, c = 2 * Math.PI * r; return `<svg class="ring" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}"><circle cx="${size / 2}" cy="${size / 2}" r="${r}" class="ring-bg"/><circle cx="${size / 2}" cy="${size / 2}" r="${r}" class="ring-fg" stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${(c * (1 - clamp(pct, 0, 1))).toFixed(1)}"/>${label != null ? `<text x="50%" y="54%" text-anchor="middle" class="ring-text">${label}</text>` : ''}</svg>`; }
 function setHTML(sel, html) { const el = typeof sel === 'string' ? $(sel) : sel; if (el) el.innerHTML = html; return el; }
-function toast(msg, kind, ms) { const t = document.createElement('div'); t.className = 'toast ' + (kind || ''); t.textContent = msg; els.toasts.appendChild(t); clock.setTimeout(() => t.remove(), ms || CONST.anim.toast); } // stays up for its virtual duration even under skipAnims
+function toast(msg, kind, ms) { const t = document.createElement('div'); t.className = 'toast ' + (kind || ''); t.textContent = msg; els.toasts.appendChild(t); clock.setTimeout(() => t.remove(), ms || CONST.anim.toast, true); } // stays up for its virtual duration even under skipAnims; its timer survives a reset's clearAll
 function dialog(o) { // in-page dialogs only (native alert/confirm are unavailable in the artifact host)
-  const d = document.createElement('div'); d.className = 'modal-wrap'; d.innerHTML = `<div class="modal" role="dialog" aria-modal="true">${o.title ? `<h3>${esc(o.title)}</h3>` : ''}${o.html || ''}<div class="modal-btns">${(o.buttons || [{ label: 'Close' }]).map((b, i) => `<button class="${b.primary ? 'primary' : b.danger ? 'danger' : 'ghost'}" data-dlg="${i}">${esc(b.label)}</button>`).join('')}</div></div>`;
+  const d = document.createElement('div'); d.className = 'modal-wrap'; d.innerHTML = `<div class="modal" role="dialog" aria-modal="true" aria-label="${esc(o.title || o.label || 'Dialog')}">${o.title ? `<h3>${esc(o.title)}</h3>` : ''}${o.html || ''}<div class="modal-btns">${(o.buttons || [{ label: 'Close' }]).map((b, i) => `<button class="${b.primary ? 'primary' : b.danger ? 'danger' : 'ghost'}" data-dlg="${i}">${esc(b.label)}</button>`).join('')}</div></div>`;
   d.addEventListener('click', (e) => { const b = e.target.closest('[data-dlg]'); if (b) { const btn = (o.buttons || [{}])[+b.dataset.dlg]; d.remove(); if (btn && btn.onClick) btn.onClick(d); } else if (e.target === d && !o.sticky) d.remove(); });
   els.modals.appendChild(d); return d;
 }
@@ -1303,6 +1338,13 @@ function go(name) {
   else if (name === 'pack') { if (!$('.pack-stage', els.app)) return goHome(); } else if (name === 'battle') { if (!LIVE) return goHome(); }
   show(name);
 }
+const ICON = { // small inline icons for the Home row (no fonts, no network)
+  team: '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M4 4l10 10M20 4L10 14M4 20l4-4M20 20l-4-4M6 14l4 4M18 14l-4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+  ladder: '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M8 3v18M16 3v18M8 7h8M8 12h8M8 17h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+  binder: '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M5 4h11a3 3 0 0 1 3 3v13H5zM5 4v16M9 4v16M12 9h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>',
+  shop: '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M4 8h16l-1.5 12h-13zM9 8V6a3 3 0 0 1 6 0v2" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>',
+};
+const focusCaption = () => (save.focus >= CONST.focus.max ? 'Focus full' : focusNextMs() == null ? 'paused' : 'next in ' + fmtMS(focusNextMs()));
 function renderHome() {
   focusCatchUp();
   const s = save, m = model, rv = RIVALS[s.ladder.nextRung - 1], seen = s.ladder.seenTeams[rv.rung], nxt = focusNextMs(), del = deliveryState();
@@ -1320,12 +1362,12 @@ function renderHome() {
   }
   if (m.segment === 'RESISTANT') tiles.push(`<div class="tile meter"><b>Guaranteed Holo in ${CONST.odds.pityEvery - s.packsSincePity} packs</b>${ring(s.packsSincePity / CONST.odds.pityEvery, 34, '')}</div>`); // the pity meter, shown only to the hard-to-monetise
   setHTML(els.screens.home, `
-    <div class="topbar"><div class="focus"><div class="pips">${pips}</div><small data-tick="focus">${s.focus < CONST.focus.max && nxt != null ? 'next in ' + fmtMS(nxt) : s.focus < CONST.focus.max ? 'paused' : ''}</small></div>
+    <div class="topbar"><div class="focus"><div class="pips">${pips}</div><small data-tick="focus">${focusCaption()}</small></div>
       <div class="coins" data-hold="lab" title="Hold 1.5 s for the Researcher View"><i class="coin"></i><span data-tick="coins">${s.coins}</span></div>
       <div class="streak" title="Daily streak"><i class="flame"></i>${s.streak.days}d</div><button class="icon" data-act="go:settings" aria-label="Settings">⚙</button></div>
     <div class="rival"><div class="rival-head">${renderPortrait(rv, ++svgSeq)}<div><div class="rival-name">${esc(rv.name)}</div><div class="rival-sub">Rung ${rv.rung} · ${rv.league} League${s.ladder.cleared[rv.rung] ? ' · Rematch · 60% coins' : ''}</div>${rv.specialty ? `<span class="chip sys-${rv.specialty}">${SYSTEMS[rv.specialty].name} specialist</span>` : '<span class="chip">Any System</span>'}<div class="quip">“${esc(rv.quip)}”</div></div></div>${team}</div>
     <button class="battle-btn${s.focus <= 0 ? ' empty' : ''}" data-act="battle">▶ BATTLE <small>${s.focus <= 0 ? '(no Focus · next in <span data-tick="focus2">' + (nxt != null ? fmtMS(nxt) : '--:--') + '</span>)' : '(1 Focus)'}</small></button>
-    <div class="row4"><button data-act="go:team">TEAM${teamPip}</button><button data-act="go:ladder">LADDER</button><button data-act="go:binder">BINDER ${ring(binder.ownedCount() / 60, 26, binder.ownedCount())}</button><button data-act="go:shop">SHOP</button></div>
+    <div class="row4"><button data-act="go:team"><span class="ic">${ICON.team}</span>TEAM${teamPip}</button><button data-act="go:ladder"><span class="ic">${ICON.ladder}</span>LADDER</button><button data-act="go:binder"><span class="ic">${ICON.binder}</span>BINDER ${ring(binder.ownedCount() / CARDS.length, 26, binder.ownedCount())}</button><button data-act="go:shop"><span class="ic">${ICON.shop}</span>SHOP</button></div>
     <div class="tiles">${tiles.join('')}</div>
     <div class="fomo">Action Potential rotates in <span data-tick="rotation">${fmtClock(rotationLeftMs())}</span></div>
     ${bannerHtml()}`);
@@ -1335,7 +1377,8 @@ function renderLadder() {
   for (const rv of RIVALS) {
     if (rv.league !== league) { league = rv.league; html += `<div class="league">${league} League${rv.wall ? ' · wall' : ''}</div>`; }
     const cleared = !!s.ladder.cleared[rv.rung], unlocked = rv.rung <= Math.min(12, s.ladder.best + 1), next = rv.rung === s.ladder.nextRung, seen = s.ladder.seenTeams[rv.rung];
-    html += `<button class="rung${cleared ? ' cleared' : ''}${unlocked ? '' : ' locked'}${next ? ' next' : ''}" data-act="rung:${rv.rung}" ${unlocked ? '' : 'disabled'}>${renderPortrait(rv, ++svgSeq)}<div><div class="rival-name">${esc(rv.name)}${rv.rung === s.ladder.best && s.ladder.best > 0 ? ' <span class="pbmark">PB</span>' : ''}</div><div class="rival-sub">Rung ${rv.rung}${rv.specialty ? ' · ' + SYSTEMS[rv.specialty].name : ''}${cleared ? ' · Rematch · 60% coins' : unlocked ? '' : ' · locked'}</div></div><div class="rung-team">${seen ? seen.map((id) => `<span class="dot sys-${BYID[id].sys}"></span>`).join('') : '<span class="q">?</span><span class="q">?</span><span class="q">?</span>'}</div>${cleared ? '<span class="tick">✓</span>' : ''}</button>`;
+    const names = seen ? seen.map((id) => BYID[id].name).join(', ') : '';
+    html += `<button class="rung${cleared ? ' cleared' : ''}${unlocked ? '' : ' locked'}${next ? ' next' : ''}" data-act="rung:${rv.rung}" ${unlocked ? '' : 'disabled'}>${renderPortrait(rv, ++svgSeq)}<div><div class="rival-name">${esc(rv.name)}${rv.rung === s.ladder.best && s.ladder.best > 0 ? ' <span class="pbmark">PB</span>' : ''}</div><div class="rival-sub">Rung ${rv.rung}${rv.specialty ? ' · ' + SYSTEMS[rv.specialty].name : ''}${cleared ? ' · Rematch · 60% coins' : unlocked ? '' : ' · locked'}</div>${seen ? `<div class="rung-last" title="${esc(names)}">Last faced: ${esc(names)}</div>` : ''}</div><div class="rung-team">${seen ? seen.map((id) => `<span class="dot sys-${BYID[id].sys}" title="${esc(BYID[id].name)}"></span>`).join('') : '<span class="q">?</span><span class="q">?</span><span class="q">?</span>'}</div>${cleared ? '<span class="tick">✓</span>' : ''}</button>`;
   }
   html += '</div>'; if (s.ladder.cleared[12]) html += `<div class="fomo">Season 2 in ${fmtClock(rotationLeftMs())}</div>`;
   setHTML(els.screens.ladder, html);
@@ -1371,8 +1414,8 @@ function renderSettings() {
   setHTML(els.screens.settings, `<div class="head"><button class="back" data-act="go:home">‹ Home</button><h2>Settings</h2></div>
     <div class="about">${ABOUT_TEXT}</div>
     <div class="setting"><span>Animation speed</span><div class="seg"><button class="${save.settings.animSpeed === 1 ? 'on' : ''}" data-act="anim:1">1×</button><button class="${save.settings.animSpeed === 0.5 ? 'on' : ''}" data-act="anim:0.5">2×</button></div></div>
-    <div class="setting"><span>Researcher View</span><button class="ghost sm" data-act="lab-toggle">${labOpen ? 'Close' : 'Open'}</button></div>
-    <div class="setting"><span>Seed</span><input class="seedbox" readonly value="${save.seed}"><button class="ghost sm" data-act="copy-seed">Copy</button></div>
+    <div class="setting"><span>Researcher View <small class="muted" data-lab-state>· ${labOpen ? 'open' : 'closed'}${labPinned ? ', pinned' : ''}</small></span><button class="ghost sm" data-act="lab-toggle">${labOpen ? 'Close' : 'Open'}</button></div>
+    <div class="setting"><span>Seed</span><span class="seedrow"><input class="seedbox" type="text" readonly value="${save.seed}" aria-label="Save seed (selectable)"><button class="ghost sm" data-act="copy-seed">Copy</button></span></div>
     <div class="setting"><span>Reset everything</span><button class="danger sm" data-act="reset-confirm">Reset</button></div>
     <div class="muted small">Synapse League v${CONST.version} · Set 1: Action Potential · no network, no tracking.</div>`);
 }
@@ -1391,15 +1434,15 @@ function bannerRotate() {
   bannerStart();
 }
 // Sheets and pills (§7.4, A-6.8.3)
-function offerShow(p) {
+function offerShow(p) { // every sheet and pill is a labelled dialog
   const c = p.copy;
-  if (p.pill) { els.pills.innerHTML = `<div class="pill" data-placement="${p.placement}"><button class="pill-main" data-act="offer-accept">${esc(c.primary)}</button><button class="pill-x" data-act="offer-decline" aria-label="No thanks">✕</button></div>`; return; }
-  els.sheets.innerHTML = `<div class="sheet-wrap"><div class="sheet ${p.placement}${p.special ? ' special' : ''}" data-placement="${p.placement}"><h3>${esc(c.head)}</h3>${c.body ? `<p>${esc(c.body)}</p>` : ''}<button class="primary pulse" data-act="offer-accept">${esc(c.primary)}</button>${p.placement === 'double' ? `<div class="dring">${ring(1, 28, '')}</div>` : ''}<div class="decline-slot"></div></div></div>`;
+  if (p.pill) { els.pills.innerHTML = `<div class="pill" role="dialog" aria-label="${esc(c.head || c.primary)}" data-placement="${p.placement}"><button class="pill-main" data-act="offer-accept">${esc(c.primary)}</button><button class="pill-x" data-act="offer-decline" aria-label="No thanks">✕</button></div>`; return; }
+  els.sheets.innerHTML = `<div class="sheet-wrap"><div class="sheet ${p.placement}${p.special ? ' special' : ''}" role="dialog" aria-modal="true" aria-label="${esc(c.head)}" data-placement="${p.placement}"><h3>${esc(c.head)}</h3>${c.body ? `<p>${esc(c.body)}</p>` : ''}<button class="primary pulse" data-act="offer-accept">${esc(c.primary)}</button>${p.placement === 'double' ? `<div class="dring">${ring(1, 28, '')}</div>` : ''}<div class="decline-slot"></div></div></div>`;
   requestAnimationFrame(() => { const sh = $('.sheet', els.sheets); if (sh) sh.classList.add('open'); });
-  if (p.placement === 'double') { const start = clock.now(); p.ringTimer = setInterval(() => { const fg = $('.dring .ring-fg', els.sheets); if (!fg) { clearInterval(p.ringTimer); return; } const left = 1 - (clock.now() - start) / CONST.ads.doubleRingMs; const c = 2 * Math.PI * 11; fg.setAttribute('stroke-dashoffset', (c * (1 - clamp(left, 0, 1))).toFixed(1)); }, 100); }
+  if (p.placement === 'double') p.ring = tween(CONST.ads.doubleRingMs, (k) => { const fg = $('.dring .ring-fg', els.sheets); if (fg) fg.setAttribute('stroke-dashoffset', (2 * Math.PI * 11 * k).toFixed(1)); }, null, true); // the ring empties on the clock (raw 6 s); the expiry is the exact timeout in offers.show
 }
-function offerDecline(p) { if (p.pill) return; const slot = $('.decline-slot', els.sheets); if (slot) slot.innerHTML = `<button class="decline" data-act="offer-decline">${esc(p.copy.decline)}</button>`; }
-function offerHide(p) { if (p.ringTimer) clearInterval(p.ringTimer); if (p.pill) els.pills.innerHTML = ''; else els.sheets.innerHTML = ''; }
+function offerDecline(p) { if (p.pill || offers.pending !== p) return; const slot = $(`.sheet[data-placement="${p.placement}"] .decline-slot`, els.sheets); if (slot) slot.innerHTML = `<button class="decline" data-act="offer-decline">${esc(p.copy.decline)}</button>`; } // only the sheet this offer owns
+function offerHide(p) { if (p.ring) p.ring.cancel(); if (p.pill) els.pills.innerHTML = ''; else els.sheets.innerHTML = ''; }
 function afterOffer(p, accepted, detail) {
   if (!accepted) { if (p.placement === 'freepack') renderHome(); return; }
   switch (p.placement) {
@@ -1414,15 +1457,15 @@ function afterOffer(p, accepted, detail) {
 // Ad overlays (§7.5): DOM "video" = animated CSS shapes + wordmark + progress; fake/late/moving close controls
 function adOpen(ad) {
   els.flask.classList.add('hidden');
-  if (ad.format === 'rewarded') els.ads.innerHTML = `<div class="ad rewarded" data-format="rewarded"><div class="ad-top"><span class="ad-tag">Ad · fictional</span><span class="reward-ring" data-ring>Reward in 15…</span></div>${renderPoster(ad.advertiser, true)}<div class="progress"><i></i></div><div class="ad-bottom"></div></div>`;
-  else els.ads.innerHTML = `<div class="ad interstitial" data-format="interstitial"><div class="ad-top"><span class="ad-tag">Ad · fictional</span><span class="count" data-count>you can close in 5</span></div>${renderPoster(ad.advertiser, true)}<div class="progress loop"><i></i></div><div class="x-layer"></div></div>`;
+  if (ad.format === 'rewarded') els.ads.innerHTML = `<div class="ad rewarded" data-format="rewarded" role="dialog" aria-label="Rewarded ad (fictional)"><div class="ad-top"><span class="ad-tag">Ad · fictional</span><span class="cd-ring" data-ring style="--p:0%">Reward in 15…</span></div>${renderPoster(ad.advertiser, true)}<div class="progress"><i></i></div><div class="ad-bottom"></div></div>`;
+  else els.ads.innerHTML = `<div class="ad interstitial" data-format="interstitial" role="dialog" aria-label="Interstitial ad (fictional)"><div class="ad-top"><span class="ad-tag">Ad · fictional</span><span class="count" data-count>you can close in 5</span></div>${renderPoster(ad.advertiser, true)}<div class="progress loop"><i></i></div><div class="x-layer"></div></div>`;
   els.ads.classList.add('open');
   const bar = $('.progress i', els.ads); if (bar) { bar.style.transitionDuration = (ad.format === 'rewarded' ? CONST.ads.rewardedMs : CONST.ads.interstitialLoopMs) + 'ms'; requestAnimationFrame(() => bar.classList.add('run')); }
-  if (ad.format === 'rewarded') ad.ringTimer = setInterval(() => { const r = $('[data-ring]', els.ads); if (!r || ad.unlocked) return; r.textContent = `Reward in ${Math.max(0, Math.ceil((CONST.ads.rewardedMs - (clock.now() - ad.startedAt)) / 1000))}…`; }, 250);
+  if (ad.format === 'rewarded') ad.ring = tween(CONST.ads.rewardedMs, (p) => { const r = $('[data-ring]', els.ads); if (!r) return; r.style.setProperty('--p', (p * 100).toFixed(1) + '%'); if (!ad.unlocked) r.textContent = `Reward in ${Math.max(0, Math.ceil(CONST.ads.rewardedMs * (1 - p) / 1000))}…`; }, null, true); // countdown ring + bar, both on the virtual clock (raw: the ad's own 15 s, never collapsed)
 }
 function adDecoy(ad) { const b = $('.ad-bottom', els.ads); if (b) b.innerHTML = '<button class="link grey decoy-skip" data-act="ad-skip">Skip? You\'ll lose the reward</button>'; }
 function adUnlocked(ad) { const r = $('[data-ring]', els.ads); if (r) r.textContent = 'Reward unlocked ✓'; const b = $('.ad-bottom', els.ads); if (b) b.innerHTML = ''; }
-function adClose(ad) { if (ad && ad.ringTimer) clearInterval(ad.ringTimer); els.ads.innerHTML = ''; els.ads.classList.remove('open'); els.flask.classList.toggle('hidden', screen === 'battle'); }
+function adClose(ad) { if (ad && ad.ring) ad.ring.cancel(); els.ads.innerHTML = ''; els.ads.classList.remove('open'); els.flask.classList.toggle('hidden', screen === 'battle'); }
 function adCount(ad, n) { const c = $('[data-count]', els.ads); if (c) c.textContent = n > 0 ? `you can close in ${n}` : 'you can close now'; }
 function adDecoyX(ad) { const l = $('.x-layer', els.ads); if (l) l.insertAdjacentHTML('beforeend', '<button class="adx decoy tr" data-act="ad-decoy" aria-label="Close ad">✕</button>'); }
 function adTrueX(ad, px) { const l = $('.x-layer', els.ads); if (l) l.insertAdjacentHTML('beforeend', `<button class="adx true ${['tl', 'tr', 'bl', 'br'][ad.corner]}" style="width:${px}px;height:${px}px;font-size:${Math.round(px * 0.6)}px" data-act="ad-x" aria-label="Close ad">✕</button>`); }
@@ -1462,7 +1505,7 @@ function onVisibility() {
 function refreshHome() { if (!hasDOM || !els.app) return; if (screen === 'home' && save.onboarding.step >= 6 && !LIVE) renderHome(); labRender(); }
 function tick() { // display refresh only (countdowns, activeMs); the model's timers live in the clock
   const now = clock.now(); if (!document.hidden && now - model.session.lastInputAt < CONST.patience.idleMs) model.session.activeMs += 1000;
-  $$('[data-tick]', els.app).forEach((el) => { const k = el.dataset.tick; if (k === 'focus' || k === 'focus2') { const n = focusNextMs(); el.textContent = save.focus >= CONST.focus.max ? '' : n == null ? 'paused' : (k === 'focus' ? 'next in ' : '') + fmtMS(n); } else if (k === 'rotation') el.textContent = fmtClock(rotationLeftMs()); else if (k === 'delivery') { const d = deliveryState(); if (d.ready) renderHomeIfVisible(); else el.textContent = fmtClock(d.msLeft); } else if (k === 'claim') { const d = deliveryState(); el.textContent = fmtMS(d.claimLeft); } else if (k === 'coins') el.textContent = String(save.coins); });
+  $$('[data-tick]', els.app).forEach((el) => { const k = el.dataset.tick; if (k === 'focus') el.textContent = focusCaption(); else if (k === 'focus2') { const n = focusNextMs(); el.textContent = save.focus >= CONST.focus.max ? '' : n == null ? 'paused' : fmtMS(n); } else if (k === 'rotation') el.textContent = fmtClock(rotationLeftMs()); else if (k === 'delivery') { const d = deliveryState(); if (d.ready) renderHomeIfVisible(); else el.textContent = fmtClock(d.msLeft); } else if (k === 'claim') { const d = deliveryState(); el.textContent = fmtMS(d.claimLeft); } else if (k === 'coins') el.textContent = String(save.coins); });
   if (screen === 'home' && save.focus < CONST.focus.max) { const n = focusNextMs(); if (n === 0) renderHomeIfVisible(); }
 }
 function renderHomeIfVisible() { if (screen === 'home' && !LIVE) renderHome(); else if (screen === 'shop') renderShop(); }
@@ -1528,6 +1571,7 @@ const ui = {
     els.app.addEventListener('pointerdown', onInput); els.app.addEventListener('keydown', onInput);
     let hold = null; els.app.addEventListener('pointerdown', (e) => { if (e.target.closest('[data-hold="lab"]')) hold = setTimeout(() => labToggle(true), 1500); }); ['pointerup', 'pointercancel', 'pointerleave'].forEach((ev) => els.app.addEventListener(ev, () => { if (hold) { clearTimeout(hold); hold = null; } }));
     els.app.addEventListener('pointermove', onPointerMoveHolo); els.app.addEventListener('pointerdown', onPointerMoveHolo);
+    els.app.addEventListener('focusin', (e) => { if (e.target.classList && e.target.classList.contains('seedbox')) e.target.select(); }); // the seed is a selectable field (A-7.1.4)
     els.flask.addEventListener('click', () => labToggle());
     els.lab.addEventListener('pointerdown', (e) => e.stopPropagation()); els.lab.addEventListener('click', (e) => { const t = e.target.closest('[data-act]'); if (t) { e.preventDefault(); onAct(t.dataset.act, t, e); } });
     document.addEventListener('keydown', (e) => { if ((e.key === 'l' || e.key === 'L') && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement && document.activeElement.tagName)) labToggle(); });
@@ -1536,8 +1580,8 @@ const ui = {
     tickTimer = setInterval(tick, 1000); armIdle();
     if (upgraded) toast('Save upgraded — starting fresh', 'warn', 3000);
     labPinned = !!prefs.pinned; if (prefs.lab || /[?&]lab=1/.test(location.search)) labToggle(true, true);
-    if (save.onboarding.step < 6) { show('home'); renderHome(); onboardingResume(); } else goHome();
-    try { if (window.claude && window.claude.hot && window.claude.hot.ready) window.claude.hot.ready(); } catch (err) { /* optional host hook */ }
+    if (save.onboarding.step < 6) { show('home'); renderHome(); onboardingResume(); } else if (resumePack) { renderHome(); packSummary(resumePack, true); resumePack = null; } else goHome();
+    try { const hot = window.claude && window.claude.hot; if (hot && hot.snapshot) hot.snapshot(() => ({ seed: save.seed, phase: model.phase, screen, step: save.onboarding.step })); if (hot && hot.ready) hot.ready(); } catch (err) { /* optional host hooks */ }
   },
   resetAll: U(function () { els.sheets.innerHTML = ''; els.pills.innerHTML = ''; els.ads.innerHTML = ''; els.ads.classList.remove('open'); els.coach.innerHTML = ''; els.modals.innerHTML = ''; els.about.classList.remove('open'); for (const k in els.screens) els.screens[k].innerHTML = ''; bannerStop(); PK = null; teamDraft = null; show('home'); renderHome(); onboardingResume(); labRender(); }),
   go: U(go), refreshHome: U(refreshHome), toast: U(toast), noAnim: U((b) => els.app.classList.toggle('noanim', !!b)),
@@ -1562,15 +1606,15 @@ function hpCardHtml(side, m, L) {
 function renderSide(L, side) {
   const S = L.B[side], m = S.team[S.active];
   setHTML(bEl('hp-' + side), hpCardHtml(side, m, L));
-  const spr = bEl('spr-' + side); spr.innerHTML = renderSprite(m.card, 160); spr.className = `spr ${side} bob-${m.sys}${alive(m) ? '' : ' fainted'}`;
-  setHTML(bEl('bench-' + side), S.team.map((b, i) => (i === S.active ? '' : `<span class="bchip${alive(b) ? '' : ' out'}" title="${esc(b.name)}">${renderSprite(b.card, 28)}<i style="width:${(100 * Math.max(0, b.hp) / b.HP_max).toFixed(0)}%"></i></span>`)).join(''));
+  const spr = bEl('spr-' + side); spr.innerHTML = renderSprite(m.card, 180); spr.className = `spr ${side} bob-${m.sys}${alive(m) ? '' : ' fainted'}`;
+  setHTML(bEl('bench-' + side), S.team.map((b, i) => { if (i === S.active) return ''; const pct = Math.round(100 * Math.max(0, b.hp) / b.HP_max); return `<span class="bchip${alive(b) ? '' : ' out'}" title="${esc(b.name)} · ${pct}%">${renderSprite(b.card, 28)}<i style="width:${pct}%"></i><small>${pct}%</small></span>`; }).join(''));
 }
 function caption(text, color) { const c = bEl('caption'); c.textContent = text; c.style.color = color || ''; c.classList.remove('flash'); void c.offsetWidth; c.classList.add('flash'); }
 function battleStart(L) {
   const B = L.B, rv = L.rival;
   setHTML(els.screens.battle, `<div class="battle-head"><span class="bh-name">${esc(rv.name)} · Rung ${L.rung}</span>${L.tutorial ? '' : '<button class="link grey" data-act="forfeit">Forfeit</button>'}</div>
-    <div class="arena" id="arena"><div class="hpcard opp" id="hp-opp"></div><div class="spr opp" id="spr-opp"></div><div class="bench opp" id="bench-opp"></div><div class="spr player" id="spr-player"></div><div class="hpcard player" id="hp-player"></div><div class="bench player" id="bench-player"></div><div class="fx" id="fx"></div><div class="stamps" id="stamps"></div></div>
-    <div class="caption" id="caption"></div><div class="cmd" id="cmd"></div>
+    <div class="arena" id="arena"><div class="hpcard opp" id="hp-opp"></div><div class="spr opp" id="spr-opp"></div><div class="bench opp" id="bench-opp" aria-live="polite" aria-label="Opponent bench"></div><div class="spr player" id="spr-player"></div><div class="hpcard player" id="hp-player"></div><div class="bench player" id="bench-player" aria-live="polite" aria-label="Your bench"></div><div class="fx" id="fx"></div><div class="stamps" id="stamps"></div></div>
+    <div class="caption" id="caption" aria-live="polite"></div><div class="cmd" id="cmd"></div>
     <div class="trainer" id="trainer" data-act="skip-intro">${renderPortrait(rv, ++svgSeq)}<div class="t-name">${esc(rv.name)}</div><div class="t-sub">Rung ${L.rung} · ${rv.league} League</div>${rv.specialty ? `<span class="chip sys-${rv.specialty}">${SYSTEMS[rv.specialty].name} specialist</span>` : '<span class="chip">Any System</span>'}<div class="t-team">${B.opp.team.map((m) => miniCard(m.card, { copies: 1 })).join('')}</div><div class="vs">VS</div><small>tap to skip</small></div>`);
   show('battle'); coachClear();
   renderSide(L, 'opp'); renderSide(L, 'player');
@@ -1589,6 +1633,7 @@ function battleChoose(L) {
   const me = B.player.team[B.player.active], you = B.opp.team[B.opp.active], seen = save.seen;
   const hint = (m) => { const e = TYPE_CHART[m.sys][you.sys]; if (!(seen[m.sys] && seen[m.sys][you.sys])) return ''; return e > 1 ? '<span class="hint up">▲ Super effective</span>' : e < 1 ? '<span class="hint down">▼ Not very effective</span>' : ''; };
   setHTML(bEl('cmd'), `<div class="moves">${me.moves.map((m, i) => `<button class="move" data-act="move:${i}"><b>${esc(m.name)}</b><span class="mrow">${sysChip(m.sys, true)}<span class="pw">${m.power}</span>${m.kw ? `<span class="kw">${SET.effects[m.kw].badge}</span>` : ''}</span>${hint(m)}</button>`).join('')}</div><button class="switch" data-act="switch-open" ${aliveCount(B.player.team) > 1 ? '' : 'disabled'}>SWITCH</button>`);
+  caption(`What will ${me.name} do?`);
   if (L.tutorial) { if (B.turn === 1 && !L.coach1) { L.coach1 = true; coach('Tap a move', '.move', 'move'); } else if (L.firstFaintSeen && !L.coach3) { L.coach3 = true; coach('Switch when the matchup is bad', '.switch', 'switch'); } }
 }
 function benchOpen(replace) {
@@ -1597,7 +1642,9 @@ function benchOpen(replace) {
   const ff = $('[data-act="forfeit"]', els.screens.battle); if (ff) ff.classList.toggle('hidden', !!replace);
 }
 function battleAct(kind, arg) { const L = LIVE; if (!L || L.busy) return; coachClear(); skipIntro(); L.busy = true; setHTML(bEl('cmd'), '<div class="cmd-wait"></div>'); const r = act(kind, arg); if (r && r.error) { L.busy = false; battleChoose(L); } }
-function dmgNumber(side, text, cls) { const fx = bEl('fx'); const s = document.createElement('span'); s.className = 'dmg ' + side + ' ' + (cls || ''); s.textContent = text; fx.appendChild(s); after(CONST.anim.dmgFloat + 100, () => s.remove()); }
+function dmgNumber(side, text, cls, tags) { // signed number plus honest tags (CRIT, ×1.5, ×0.67)
+  const fx = bEl('fx'); const s = document.createElement('span'); s.className = 'dmg ' + side + ' ' + (cls || ''); s.innerHTML = esc(text) + (tags || []).map((t) => `<i class="tag">${esc(t)}</i>`).join(''); fx.appendChild(s); after(CONST.anim.dmgFloat + 100, () => s.remove());
+}
 function updateHp(side, m, dmgMs, hp) { // `hp` is the value right after this event (the engine resolved the whole turn already)
   const card = bEl('hp-' + side), cur = hp != null ? hp : m.hp, pct = clamp(Math.max(0, cur) / m.HP_max, 0, 1) * 100, fill = $('.fill', card), ghost = $('.ghost', card), bar = $('.bar', card);
   if (fill) { fill.style.transitionDuration = dur(dmgMs) + 'ms'; fill.style.width = pct.toFixed(1) + '%'; }
@@ -1613,7 +1660,7 @@ function battleChoreo(L, events, done) {
     if (e.t === 'switch') steps.push({ fn: () => caption(`${e.from.name}, come back!`), ms: A.stamp }, { fn: () => { renderSide(L, side); bEl('spr-' + side).classList.add('pop'); }, ms: A.sendOut });
     else if (e.t === 'hit') {
       steps.push({ fn: () => { const s = bEl('spr-' + side); s.classList.remove('lunge-l', 'lunge-r'); void s.offsetWidth; s.classList.add(side === 'player' ? 'lunge-r' : 'lunge-l'); }, ms: A.lunge });
-      steps.push({ fn: () => { caption(e.move.name, sysColor(e.move.sys)); const t = bEl('spr-' + other); t.classList.remove('hitflash'); void t.offsetWidth; t.classList.add('hitflash'); dmgNumber(other, String(e.dmg), e.crit ? 'crit' : ''); updateHp(other, e.target, Math.min(A.hpDrainMax, e.dmg * A.hpDrainPerDmg), e.targetHp); }, ms: Math.min(A.hpDrainMax, e.dmg * A.hpDrainPerDmg) + A.flash });
+      steps.push({ fn: () => { caption(e.move.name, sysColor(e.move.sys)); const t = bEl('spr-' + other); t.classList.remove('hitflash'); void t.offsetWidth; t.classList.add('hitflash'); dmgNumber(other, '−' + e.dmg, e.crit ? 'crit' : '', [e.crit ? 'CRIT' : null, e.eff > 1 ? '×' + e.eff : e.eff < 1 ? '×' + e.eff : null].filter(Boolean)); updateHp(other, e.target, Math.min(A.hpDrainMax, e.dmg * A.hpDrainPerDmg), e.targetHp); }, ms: Math.min(A.hpDrainMax, e.dmg * A.hpDrainPerDmg) + A.flash });
       if (e.crit || e.eff !== 1) steps.push({ fn: () => { caption(e.crit ? 'Critical hit!' : e.eff > 1 ? 'Super effective!' : 'Not very effective…'); if (e.crit) { const a = bEl('arena'); a.classList.remove('shake'); void a.offsetWidth; a.classList.add('shake'); } if (L.tutorial && e.eff > 1 && !L.coach2) { L.coach2 = true; coach('Super effective! Motor beats Sensory — every System beats one and is beaten by one', '#hp-opp', 'se'); } }, ms: A.caption });
       if (e.drained) steps.push({ fn: () => { dmgNumber(side, `+${e.drained}`, 'heal'); updateHp(side, e.user, A.tick, e.userHp); }, ms: A.tick });
       if (e.recoil) steps.push({ fn: () => { dmgNumber(side, `−${e.recoil}`, 'recoil'); updateHp(side, e.user, A.tick, e.userHp); }, ms: A.tick });
@@ -1659,10 +1706,12 @@ function packReveal(r, opts) {
 }
 function packTear() {
   if (!PK || PK.opened) return; PK.opened = true; const r = PK.r, stage = $('.pack-stage', els.screens.pack), sprite = $('.pack-sprite', stage), fan = $('.fan', stage), A = CONST.anim;
+  const n = r.cards.length, fc = (c, i) => { const k = i - (n - 1) / 2; return `<div class="fc${i === PK.last ? ' last locked' : ''}" data-i="${i}" ${i === PK.last ? 'data-act="flip-last"' : `data-act="flip:${i}"`} style="--tx:${(k * 60).toFixed(0)}px;--ty:${(Math.abs(k) * 10).toFixed(0)}px;--rot:${(k * 6).toFixed(0)}deg"><div class="inner"><div class="back"><span class="logo">SYNAPSE<br>LEAGUE</span><small>${esc(SET.code)} · Set 1</small>${i === PK.last ? '<i class="lock" aria-hidden="true">🔒</i>' : ''}</div><div class="face">${cardHtml(c, { copies: save.collection[c.id] })}</div></div><div class="cue"></div></div>`; }; // a real fan: per-card offset/rotation, set-logo backs, the lock badge in a corner
   runSeq([{ fn: () => sprite.classList.add('squash'), ms: A.packSquash }, { fn: () => { sprite.classList.remove('squash'); sprite.classList.add('up'); }, ms: A.packSlide }, { fn: () => sprite.classList.add('torn'), ms: A.tear },
-    { fn: () => { sprite.classList.add('gone'); stage.dataset.state = 'fan'; fan.innerHTML = r.cards.map((c, i) => `<div class="fc${i === PK.last ? ' last locked' : ''}" data-i="${i}" ${i === PK.last ? 'data-act="flip-last"' : `data-act="flip:${i}"`}><div class="inner"><div class="back"><span>AP1</span></div><div class="face">${cardHtml(c, { copies: save.collection[c.id] })}</div></div><div class="cue"></div></div>`).join(''); }, ms: A.fanStagger * 5 }],
+    { fn: () => { sprite.classList.add('gone'); stage.dataset.state = 'fan'; fan.innerHTML = r.cards.map(fc).join(''); $$('.fc', fan).forEach((el, i) => after(A.fanStagger * i, () => el.classList.add('in'))); }, ms: A.fanStagger * 5 }],
     () => { if (PK.coach) coach('Tap a card to flip it', '.fc', 'flip'); if (settings.skipAnims) { for (let i = 0; i < PK.last; i++) packFlip(i); } });
 }
+const CHARGE_GLOW = { grey: 'var(--rC)', green: 'var(--rU)', silver: 'var(--rR)', rainbow: 'var(--violet)', gold: 'var(--gold)', binder: 'var(--rR)' };
 function packFlip(i) {
   if (!PK || !PK.opened || PK.faceUp.has(i) || i === PK.last) return; PK.faceUp.add(i); coachClear();
   const c = PK.r.cards[i], el = $(`.fc[data-i="${i}"]`, els.screens.pack), A = CONST.anim; if (!el) return;
@@ -1682,10 +1731,11 @@ function legendaryArcs(el, c) { // 1.2 s of lightning arcs on a canvas overlay: 
 }
 function packChargeLast() {
   const el = $('.fc.last', els.screens.pack), c = PK.r.cards[PK.last], A = CONST.anim, bait = PK.r.bait; if (!el) return;
-  el.classList.remove('locked'); el.classList.add('center'); const cue = $('.cue', el);
+  el.classList.remove('locked'); el.classList.add('center'); const cue = $('.cue', el), back = $('.back', el);
   const hue = bait ? (bait.kind === 'binder' ? 'binder' : 'rainbow') : { C: 'grey', U: 'green', R: 'silver', H: 'rainbow', L: 'gold' }[c.rarity]; // honest hue, except on a bait pack
-  const steps = [{ ms: A.sendOut }, { fn: () => { cue.className = 'cue charge ' + hue; if (bait && bait.kind === 'binder') cue.innerHTML = `<div class="ghost-card">${cardHtml(BYID[bait.shown], { owned: false })}</div>`; el.dataset.hue = hue; }, ms: A.charge }];
-  if (bait) steps.push({ fn: () => cue.classList.add('glint'), ms: A.glint }, { fn: () => { cue.classList.remove('glint'); cue.classList.add('stall'); }, ms: A.stall }, { fn: () => { cue.classList.remove('stall'); cue.classList.add('deflate'); cue.classList.remove('rainbow', 'binder'); cue.classList.add('grey'); cue.innerHTML = ''; }, ms: A.deflate });
+  const setP = (pct) => cue.style.setProperty('--p', pct.toFixed(1) + '%'); // the ring fills on the virtual clock (no CSS @property)
+  const steps = [{ ms: A.sendOut }, { fn: () => { cue.className = 'cue charge ' + hue; setP(0); if (bait && bait.kind === 'binder') cue.innerHTML = `<div class="ghost-card">${cardHtml(BYID[bait.shown], { owned: false })}</div>`; el.dataset.hue = hue; if (back) back.style.setProperty('--glow', CHARGE_GLOW[hue]); PK.charge = tween(A.charge, (p) => setP(p * (bait ? 95 : 100))); }, ms: A.charge }];
+  if (bait) steps.push({ fn: () => cue.classList.add('glint'), ms: A.glint }, { fn: () => { cue.classList.remove('glint'); cue.classList.add('stall'); }, ms: A.stall }, { fn: () => { cue.classList.remove('stall'); cue.classList.add('deflate'); cue.classList.remove('rainbow', 'binder'); cue.classList.add('grey'); cue.innerHTML = ''; if (back) back.style.setProperty('--glow', CHARGE_GLOW.grey); PK.charge = tween(A.deflate, (p) => setP(95 * (1 - p))); }, ms: A.deflate });
   runSeq(steps, () => { PK.charged = true; el.classList.add('charged'); if (settings.skipAnims) packFlipLast(false); else PK.autoTimer = clock.setTimeout(() => packFlipLast(false), dur(A.autoFlip)); });
 }
 function packFlipLast(byTap) {
@@ -1694,6 +1744,7 @@ function packFlipLast(byTap) {
   runSeq([{ fn: () => el.classList.add('half'), ms: A.flipOut }, { fn: () => { el.classList.remove('half'); el.classList.add('flipped'); $('.cue', el).className = 'cue'; }, ms: A.flipIn }], () => { landingCue(el, c); after(A.summary, () => packSummary(PK.r, false)); });
 }
 function packSummary(r, instant) {
+  packs.apply(r); // the Summary is where a pack's counters, patience terms and pack.end land (once)
   PK = PK && PK.r === r ? PK : { r }; const A = CONST.anim, weak = weakestTeamSlot();
   let best = null; r.cards.forEach((c, i) => { const p = cardPower(c, save.collection[c.id]); if (save.team.length === 3 && !save.team.includes(c.id) && p > weak.power && (!best || p > best.p)) best = { c, p, i }; });
   if (best) save.teamPip = true;
@@ -1716,7 +1767,8 @@ function onPointerMoveHolo(e) { // only the Holo card under the pointer animates
 }
 
 /* ============================================================ 15. Researcher View ("Lab", §8). Read-only: renders model/save/log, draws from no stream, changes state only through the explicit override buttons. */
-let labFilter = '', labAboutOpen = false, labConstOpen = false, labRaf = null, labLast = {};
+const LAB_TABS = [['value', 'Value'], ['patience', 'Patience'], ['phase', 'Phase'], ['battle', 'Battle rig'], ['pack', 'Pack rig'], ['revenue', 'Revenue'], ['log', 'Log'], ['machine', 'Machine'], ['over', 'Overrides']];
+let labFilter = '', labConstOpen = false, labRaf = null, labLast = {}, labTab = 'value', labScroll = {}; // one tab on screen at a time; each remembers its scroll position
 const f2 = (x) => (x == null ? '—' : (+x).toFixed(2));
 const pct = (x) => (x == null ? '—' : Math.round(x * 100) + '%');
 const LAB_TYPE_CLASS = (t) => (/^(bait|rig\.|kill|inflate)/.test(t) ? 'ev-rig' : /^(offer|ad\.|revenue)/.test(t) ? 'ev-ad' : /^(phase|segment|quit|patience|model)/.test(t) ? 'ev-model' : /^battle/.test(t) ? 'ev-battle' : /^pack/.test(t) ? 'ev-pack' : /^lab/.test(t) ? 'ev-lab' : '');
@@ -1732,36 +1784,37 @@ function labRender() {
 }
 function labRenderNow() {
   const m = model, s = save, k = killTerms(), lb = m.lastBattle, lp = m.lastPack, ses = m.session, inp = m.inputs, raw = inp.raw || {};
+  const body0 = $('.lab-body', els.lab); if (body0 && body0.dataset.tab === labTab) labScroll[labTab] = body0.scrollTop; // the tab on screen keeps its scroll position across re-renders
   const active = document.activeElement, keepId = active && els.lab.contains(active) ? active.id : null, keepVal = keepId ? active.value : null, keepSel = keepId ? active.selectionStart : null;
-  const phases = PHASES.map((p) => `<span class="node${m.phase === p ? ' on' : ''}">${p}</span>`).join('<i>›</i>');
   const bar = (v, max, cls) => `<div class="lbar ${cls || ''}"><i style="width:${(100 * clamp(v / max, 0, 1)).toFixed(1)}%"></i></div>`;
-  const killLine = m.T - CONST.patience.killLine, cleanLine = m.T - CONST.patience.cleanLine;
-  const decisions = m.decisions.slice(-5).map((d) => (d ? 'A' : 'D')).join('') || '—';
+  const kv = (key, val) => `<tr><td>${key}</td><td>${esc(String(val))}</td></tr>`, nameCell = (name) => `<td class="name" title="${esc(name)}">${esc(name)}</td>`;
   const offersBy = {}; for (const e of LOG.entries) { if (e.type === 'offer.show') (offersBy[e.data.placement] = offersBy[e.data.placement] || { shown: 0, accepted: 0 }).shown++; if (e.type === 'offer.accept') (offersBy[e.data.placement] = offersBy[e.data.placement] || { shown: 0, accepted: 0 }).accepted++; }
-  const adsShown = LOG.entries.filter((e) => e.type === 'ad.show').length, perMin = ses.activeMs >= 60000 ? '$' + (m.revenue.total / (ses.activeMs / 60000)).toFixed(4) : '—';
-  const rigRows = lb ? [['tier', `shown rung ${lb.rung} → effective tier ${lb.effTier} (offset ${lb.effTier - lb.rung >= 0 ? '+' : ''}${lb.effTier - lb.rung})`], ['rollBias', `player ${lb.rig.rollBias.player} (mean ${lb.stats.meanRoll.player}, ${lb.stats.nBiased.player}/${lb.stats.nRolls.player} biased) · opp ${lb.rig.rollBias.opp} (mean ${lb.stats.meanRoll.opp}, ${lb.stats.nBiased.opp}/${lb.stats.nRolls.opp} biased)`],
-    ['critBias', `player ${lb.rig.critBias.player} (${lb.stats.crits.player.natural} natural) · opp ${lb.rig.critBias.opp} (${lb.stats.crits.opp.natural} natural / ${lb.stats.crits.opp.forced} forced)`], ['aiQ', lb.rig.aiQ], ['bait', lb.rig.bait ? (lb.rig.baitFired ? `fired · HP left ${Math.round(lb.stats.oppActivePct * 100)}%` : 'armed, not fired') : 'off'], ['stall', lb.rig.stall ? (lb.rig.stallFired ? 'fired' : 'armed, not fired') : 'off'], ['mercy', lb.rig.mercy ? (lb.rig.mercyFired ? 'fired' : 'armed') : 'off'],
-    ['sideMult', `${lb.rig.sideMult} · ${lb.stats.sideMultHits} inflated hits`], ['result', `${lb.result} (${lb.reason}) in ${lb.turns} turns${lb.stats.escaped ? ' · ESCAPED the kill' : ''}${lb.revived ? ' · revived on turn ' + lb.stats.revivedAtTurn : ''}`],
-    ['kill.armed', lb.kill && lb.kill.lossRate != null ? `base ${lb.kill.base} → tier ${lb.kill.effTier} (candidate ${lb.kill.candidate}); rehearsed loss ${pct(lb.kill.lossRate)}, near-miss ${pct(lb.kill.nearMissRate)}, revive-win ${pct(lb.kill.reviveWinRate)}${lb.kill.fallback ? ' · FALLBACK' : ''}${lb.kill.soft ? ' · soft' : ''}` : '—']] : [];
-  const packRows = lp ? lp.slots.map((x) => `<tr><td>${x.slot}</td><td>${x.rolledRarity}</td><td>${x.finalRarity}</td><td>${x.reason}</td><td>${esc(BYID[x.id].name)}</td></tr>`).join('') : '';
-  const entries = LOG.entries.filter((e) => !labFilter || e.type.includes(labFilter) || JSON.stringify(e.data).includes(labFilter)).slice(-120).reverse();
-  const constLeaves = []; (function walk(o, p) { for (const key in o) { const v = o[key]; if (typeof v === 'number') constLeaves.push([p + key, v]); else if (v && typeof v === 'object' && !Array.isArray(v) && p.split('.').length < 4) walk(v, p + key + '.'); } })(CONST, '');
-  els.lab.innerHTML = `<div class="lab-head"><b>Researcher View</b><span class="muted">live · read-only</span><button class="ghost sm${labPinned ? ' on' : ''}" data-act="lab-pin" title="Keep open while playing">pin</button><button class="icon" data-act="lab-close" aria-label="Close lab">✕</button></div><div class="lab-body">
-  <section class="lp"><h4>1 · Player value</h4><div class="gauge">adValue ${f2(m.adValue)} ${bar(m.adValue, 1, 'g-val')}</div><div class="kv">eCPM $${f2(m.eCPM)} · segment <span class="seg-${m.segment}">${m.segment}</span> · last decisions ${decisions} · affinity ${f2(m.adAffinity)}</div>
-    <table class="lt"><tr><td>device (simulated proxy)</td><td>dpr ${raw.dpr} · ${raw.sw}×${raw.sh} · ${raw.cores} cores · mem ${raw.mem == null ? 'n/a' : raw.mem} · UA class ${raw.uaClass} → score ${inp.deviceScore} → tier ${inp.deviceTier}</td></tr><tr><td>region (simulated proxy)</td><td>${esc(raw.tz || '(none)')} · ${esc(raw.lang || '')} → eCPM ${inp.regionECPM} → ${f2(inp.region)}</td></tr><tr><td>hour (simulated proxy)</td><td>${new Date(clock.now()).getHours()}h → ${inp.hourMul}${inp.pinned ? ' (pinned)' : ''}</td></tr><tr><td>A/B buckets</td><td>T0 ${m.experiments.T0} · declineDelay ${m.experiments.declineDelayMs} ms · sliver ${m.experiments.sliverPct} · postAdBoost ${m.experiments.postAdBoost}${m.experiments.pinned ? ' (pinned)' : ''}</td></tr></table></section>
-  <section class="lp"><h4>2 · Patience</h4><div class="ft"><div class="ft-bar"><i class="f" style="width:${(100 * m.F / CONST.patience.Fmax).toFixed(1)}%"></i><b class="line kill" style="left:${(100 * clamp(killLine, 0, 12) / 12).toFixed(1)}%" title="kill line T−2.5"></b><b class="line clean" style="left:${(100 * clamp(cleanLine, 0, 12) / 12).toFixed(1)}%" title="clean line T−1"></b><b class="line t" style="left:${(100 * m.T / 12).toFixed(1)}%" title="T"></b></div><div class="kv">F ${f2(m.F)} · T ${f2(m.T)} · kill line ${f2(killLine)} · clean line ${f2(cleanLine)}</div></div>
-    <div class="kv">lossTolerance ${f2(m.lossTolerance)} · packTolerance ${f2(m.packTolerance)} (drought cap ${Math.max(1, Math.floor(m.packTolerance))}) · winStreak ${m.winStreak} · lossStreak ${m.lossStreak} · battlesSinceKill ${m.battlesSinceKill}/${k.killEvery} · quit signals ${ses.quitSignals} · rapid-tap bursts ${ses.rapidTaps}</div></section>
-  <section class="lp"><h4>3 · Phase</h4><div class="nodes">${phases}</div><div class="kv">${m.phaseBattles} battle(s), ${m.phasePacks} pack(s) in phase · kills ${m.kills} (${m.killsEscaped} escaped) · revives ${ses.revives}/${CONST.segments.reviveCap[m.segment]} · rewarded ${ses.rewarded}/${CONST.ads.rewardedPerSession}</div><div class="pending">${esc(pendingTransition())}</div>
-    <div class="kv">next battle rig: ${(() => { const r = nextRigProfile(); return `${r.phase} · tier ${r.effTier} (card says ${r.base}) · rolls ${r.rollBias.player}/${r.rollBias.opp} · crits ${r.critBias.player}/${r.critBias.opp} · aiQ ${r.aiQ} · bait ${r.bait} · stall ${r.stall} · ×${r.sideMult}${r.counterPick ? ' · counter-pick' : ''}`; })()}</div>
-    <div class="kv">next pack: ${(() => { const p = packProfileFor('standard'); return `${p.row} row · R/H/L ×${p.oddsMul} · dupBias ${p.dupBias} · exclude needed ${p.excludeNeeded}${p.needed ? ' (' + BYID[p.needed].name + ')' : ''} · forced slot 5 ${p.pity ? 'pity' : p.forced5 || 'none'} · bait ${p.bait}`; })()}</div></section>
-  <section class="lp"><h4>4 · Last battle rig</h4><p class="sentence">${esc(battleSentence(lb))}</p>${lb ? `<table class="lt">${rigRows.map(([a, b]) => `<tr><td>${a}</td><td>${esc(String(b))}</td></tr>`).join('')}</table>` : ''}<div class="btns"><button class="ghost sm" data-act="lab-replay" ${lb ? '' : 'disabled'}>Replay fair</button><button class="ghost sm" data-act="lab-rehearse">Rehearse ×200</button><button class="ghost sm" data-act="lab-export-turns" ${lb ? '' : 'disabled'}>Export turns</button></div>${labLast.replay ? `<div class="kv res">Same opponent, fair dice: ${labLast.replay.sameOpponent.result.toUpperCase()} on turn ${labLast.replay.sameOpponent.turn} (${labLast.replay.sameOpponent.replayed} of ${labLast.replay.recorded} actions replayed). Honest-rung opponent: ${labLast.replay.honestRung.result.toUpperCase()}.</div>` : ''}${labLast.rehearse ? `<div class="kv res">Rehearsed ×${labLast.rehearse.n} (${labLast.rehearse.rig.phase}, tier ${labLast.rehearse.rig.effTier}${labLast.rehearse.sampled ? ', 8 regenerated opponents' : ''}): loss ${pct(labLast.rehearse.lossRate)} · near-miss ${pct(labLast.rehearse.nearMissRate)} · sliver ${pct(labLast.rehearse.sliverRate)} · bait ${pct(labLast.rehearse.baitRate)} · stall ${pct(labLast.rehearse.stallRate)} · mean ${labLast.rehearse.meanTurns} turns</div>` : ''}</section>
-  <section class="lp"><h4>5 · Last pack rig</h4>${lp ? `<p class="sentence">${esc(lp.sentence)}</p><table class="lt"><tr><th>slot</th><th>rolled</th><th>final</th><th>reason</th><th>card</th></tr>${packRows}</table><div class="kv">${lp.bait ? `bait: shown ${lp.bait.shown === 'Holo' ? 'Holo glint' : BYID[lp.bait.shown].name} → actual ${BYID[lp.bait.actual].name}` : 'no bait'} · pity counter ${lp.packsSincePity}/${CONST.odds.pityEvery}${lp.pity ? ' (pity pack)' : ''} · excluded ${lp.rig.excludeNeeded && lp.needed ? BYID[lp.needed].name : 'nothing'}</div>` : '<p class="muted">No pack yet.</p>'}</section>
-  <section class="lp"><h4>6 · Revenue (fictional)</h4><div class="kv">rewarded $${m.revenue.rewarded.toFixed(4)} · interstitial $${m.revenue.interstitial.toFixed(4)} · banner $${m.revenue.banner.toFixed(4)} · <b>total $${m.revenue.total.toFixed(4)}</b></div><div class="kv">ads shown ${adsShown} · ad seconds ${Math.round(ses.adSeconds)} · interstitials ${ses.interstitials}/${CONST.ads.interstitialsPerSession} · active ${Math.round(ses.activeMs / 1000)} s · <b>$ per minute of your attention: ${perMin}</b></div>
-    <div class="kv">offers: ${Object.entries(offersBy).map(([p, v]) => `${p} ${v.accepted}/${v.shown}`).join(' · ') || 'none yet'}</div><button class="ghost sm" data-act="lab-about">${labAboutOpen ? 'Hide' : 'About the machine'}</button>${labAboutOpen ? ABOUT_MACHINE(m, offersBy, ses) : ''}</section>
-  <section class="lp"><h4>7 · Event log</h4><div class="btns"><input id="lab-filter" placeholder="filter type…" value="${esc(labFilter)}"><button class="ghost sm" data-act="lab-export-log">Export JSON lines</button><button class="ghost sm" data-act="copy-seed">Copy seed</button></div><div class="evlog">${entries.map(fmtLogLine).join('')}</div></section>
-  <section class="lp"><h4>8 · Overrides</h4><div class="btns"><select id="lab-phase">${PHASES.filter((p) => p !== 'OFFER').map((p) => `<option ${m.phase === p ? 'selected' : ''}>${p}</option>`).join('')}</select><button class="ghost sm" data-act="lab-set-phase">force phase</button></div><div class="btns"><input id="lab-T" type="number" step="0.5" min="1.5" max="8" value="${m.T}"><button class="ghost sm" data-act="lab-set-T">set T</button><input id="lab-aff" type="number" step="0.05" min="0" max="1" value="${m.adAffinity}"><button class="ghost sm" data-act="lab-set-aff">set adAffinity</button></div>
-    <div class="btns"><select id="lab-seg">${['UNKNOWN', 'WATCHER', 'RESISTANT'].map((x) => `<option ${m.segment === x ? 'selected' : ''}>${x}</option>`).join('')}</select><button class="ghost sm" data-act="lab-set-seg">set segment</button><button class="ghost sm" data-act="lab-reset-model">reset model</button><button class="danger sm" data-act="reset-confirm">reset everything</button></div>
-    <button class="ghost sm" data-act="lab-const">${labConstOpen ? 'Hide CONST' : 'Edit CONST (not persisted)'}</button>${labConstOpen ? `<div class="consts">${constLeaves.map(([p, v]) => `<label>${p}<input type="number" step="any" value="${v}" data-const="${p}"></label>`).join('')}</div>` : ''}</section></div>`;
+  const panel = {
+    value: () => `<section class="lp"><h4>1 · Player value</h4><div class="gauge">adValue ${f2(m.adValue)} ${bar(m.adValue, 1, 'g-val')}</div><div class="kv">eCPM $${f2(m.eCPM)} · segment <span class="seg-${m.segment}">${m.segment}</span> · last decisions ${m.decisions.slice(-5).map((d) => (d ? 'A' : 'D')).join('') || '—'} · affinity ${f2(m.adAffinity)}</div>
+      <table class="lt">${kv('device (simulated proxy)', `dpr ${raw.dpr} · ${raw.sw}×${raw.sh} · ${raw.cores} cores · mem ${raw.mem == null ? 'n/a' : raw.mem} · UA class ${raw.uaClass} → score ${inp.deviceScore} → tier ${inp.deviceTier}`)}${kv('region (simulated proxy)', `${raw.tz || '(none)'} · ${raw.lang || ''} → eCPM ${inp.regionECPM} → ${f2(inp.region)}`)}${kv('hour (simulated proxy)', `${new Date(clock.now()).getHours()}h → ${inp.hourMul}${inp.pinned ? ' (pinned)' : ''}`)}${kv('A/B buckets', `T0 ${m.experiments.T0} · declineDelay ${m.experiments.declineDelayMs} ms · sliver ${m.experiments.sliverPct} · postAdBoost ${m.experiments.postAdBoost}${m.experiments.pinned ? ' (pinned)' : ''}`)}</table><p class="muted">Every input is a simulated proxy read once at boot; nothing is tracked.</p></section>`,
+    patience: () => { const killLine = m.T - CONST.patience.killLine, cleanLine = m.T - CONST.patience.cleanLine; return `<section class="lp"><h4>2 · Patience</h4><div class="ft"><div class="ft-bar"><i class="f" style="width:${(100 * m.F / CONST.patience.Fmax).toFixed(1)}%"></i><b class="line kill" style="left:${(100 * clamp(killLine, 0, 12) / 12).toFixed(1)}%" title="kill line T−2.5"></b><b class="line clean" style="left:${(100 * clamp(cleanLine, 0, 12) / 12).toFixed(1)}%" title="clean line T−1"></b><b class="line t" style="left:${(100 * m.T / 12).toFixed(1)}%" title="T"></b></div><div class="kv">F ${f2(m.F)} · T ${f2(m.T)} · kill line ${f2(killLine)} · clean line ${f2(cleanLine)}</div></div>
+      <div class="kv">lossTolerance ${f2(m.lossTolerance)} · packTolerance ${f2(m.packTolerance)} (drought cap ${Math.max(1, Math.floor(m.packTolerance))}) · winStreak ${m.winStreak} · lossStreak ${m.lossStreak} · battlesSinceKill ${m.battlesSinceKill}/${k.killEvery} · quit signals ${ses.quitSignals} · rapid-tap bursts ${ses.rapidTaps}</div><div class="kv">killReady ${k.ready ? (k.armed ? 'yes (armed)' : 'yes (soft)') : 'no'} · cleanReady ${cleanReady()} · declines ${m.declinesTotal} · kills ${m.kills} (${m.killsEscaped} escaped)</div></section>`; },
+    phase: () => `<section class="lp"><h4>3 · Phase</h4><div class="nodes">${PHASES.map((p) => `<span class="node${m.phase === p ? ' on' : ''}">${p}</span>`).join('<i>›</i>')}</div><div class="kv">${m.phaseBattles} battle(s), ${m.phasePacks} pack(s) in phase · kills ${m.kills} (${m.killsEscaped} escaped) · revives ${ses.revives}/${CONST.segments.reviveCap[m.segment]} · rewarded ${ses.rewarded}/${CONST.ads.rewardedPerSession}</div><div class="pending">${esc(pendingTransition())}</div>
+      <div class="kv">next battle rig: ${(() => { const r = nextRigProfile(); return `${r.phase} · tier ${r.effTier} (card says ${r.base}) · rolls ${r.rollBias.player}/${r.rollBias.opp} · crits ${r.critBias.player}/${r.critBias.opp} · aiQ ${r.aiQ} · bait ${r.bait} · stall ${r.stall} · ×${r.sideMult}${r.counterPick ? ' · counter-pick' : ''}`; })()}</div>
+      <div class="kv">next pack: ${(() => { const p = packProfileFor('standard'); return `${p.row} row · R/H/L ×${p.oddsMul} · dupBias ${p.dupBias} · exclude needed ${p.excludeNeeded}${p.needed ? ' (' + BYID[p.needed].name + ')' : ''} · forced slot 5 ${p.pity ? 'pity' : p.forced5 || 'none'} · bait ${p.bait}`; })()}</div></section>`,
+    battle: () => { const rows = lb ? [['tier', `shown rung ${lb.rung} → effective tier ${lb.effTier} (offset ${lb.effTier - lb.rung >= 0 ? '+' : ''}${lb.effTier - lb.rung})`], ['rollBias', `player ${lb.rig.rollBias.player} (mean ${lb.stats.meanRoll.player}, ${lb.stats.nBiased.player}/${lb.stats.nRolls.player} biased) · opp ${lb.rig.rollBias.opp} (mean ${lb.stats.meanRoll.opp}, ${lb.stats.nBiased.opp}/${lb.stats.nRolls.opp} biased)`],
+      ['critBias', `player ${lb.rig.critBias.player} (${lb.stats.crits.player.natural} natural) · opp ${lb.rig.critBias.opp} (${lb.stats.crits.opp.natural} natural / ${lb.stats.crits.opp.forced} forced)`], ['aiQ', lb.rig.aiQ], ['bait', lb.rig.bait ? (lb.rig.baitFired ? `fired · HP left ${Math.round(lb.stats.oppActivePct * 100)}%` : 'armed, not fired') : 'off'], ['stall', lb.rig.stall ? (lb.rig.stallFired ? 'fired' : 'armed, not fired') : 'off'], ['mercy', lb.rig.mercy ? (lb.rig.mercyFired ? 'fired' : 'armed') : 'off'],
+      ['sideMult', `${lb.rig.sideMult} · ${lb.stats.sideMultHits} inflated hits`], ['result', `${lb.result} (${lb.reason}) in ${lb.turns} turns${lb.stats.escaped ? ' · ESCAPED the kill' : ''}${lb.revived ? ' · revived on turn ' + lb.stats.revivedAtTurn : ''}`],
+      ['kill.armed', lb.kill && lb.kill.lossRate != null ? `base ${lb.kill.base} → tier ${lb.kill.effTier} (candidate ${lb.kill.candidate}); rehearsed loss ${pct(lb.kill.lossRate)}, near-miss ${pct(lb.kill.nearMissRate)}, revive-win ${pct(lb.kill.reviveWinRate)}${lb.kill.fallback ? ' · FALLBACK' : ''}${lb.kill.soft ? ' · soft' : ''}` : '—']] : [];
+      return `<section class="lp"><h4>4 · Last battle rig</h4><p class="sentence">${esc(battleSentence(lb))}</p>${lb ? `<table class="lt">${rows.map(([a, b]) => kv(a, b)).join('')}</table>` : ''}<div class="btns"><button class="ghost sm" data-act="lab-replay" ${lb ? '' : 'disabled'}>Replay fair</button><button class="ghost sm" data-act="lab-rehearse">Rehearse ×200</button><button class="ghost sm" data-act="lab-export-turns" ${lb ? '' : 'disabled'}>Export turns</button></div>${labLast.replay ? `<div class="kv res">Same opponent, fair dice: ${labLast.replay.sameOpponent.result.toUpperCase()} on turn ${labLast.replay.sameOpponent.turn} (${labLast.replay.sameOpponent.replayed} of ${labLast.replay.recorded} actions replayed). Honest-rung opponent: ${labLast.replay.honestRung.result.toUpperCase()}.</div>` : ''}${labLast.rehearse ? `<div class="kv res">Rehearsed ×${labLast.rehearse.n} (${labLast.rehearse.rig.phase}, tier ${labLast.rehearse.rig.effTier}${labLast.rehearse.sampled ? ', 8 regenerated opponents' : ''}): loss ${pct(labLast.rehearse.lossRate)} · near-miss ${pct(labLast.rehearse.nearMissRate)} · sliver ${pct(labLast.rehearse.sliverRate)} · bait ${pct(labLast.rehearse.baitRate)} · stall ${pct(labLast.rehearse.stallRate)} · mean ${labLast.rehearse.meanTurns} turns</div>` : ''}</section>`; },
+    pack: () => `<section class="lp"><h4>5 · Last pack rig</h4>${lp ? `<p class="sentence">${esc(lp.sentence)}</p><table class="lt pk"><tr><th>#</th><th>rolled</th><th>final</th><th>reason</th><th>card</th></tr>${lp.slots.map((x) => `<tr><td>${x.slot}</td><td>${x.rolledRarity}</td><td>${x.finalRarity}</td><td>${x.reason}</td>${nameCell(BYID[x.id].name)}</tr>`).join('')}</table><div class="kv">${lp.bait ? `bait: shown ${lp.bait.shown === 'Holo' ? 'Holo glint' : BYID[lp.bait.shown].name} → actual ${BYID[lp.bait.actual].name}` : 'no bait'} · pity counter ${lp.packsSincePity}/${CONST.odds.pityEvery}${lp.pity ? ' (pity pack)' : ''} · excluded ${lp.rig.excludeNeeded && lp.needed ? BYID[lp.needed].name : 'nothing'}${s.pendingPack ? ' · reveal in progress' : ''}</div>` : '<p class="muted">No pack yet.</p>'}</section>`,
+    revenue: () => { const adsShown = LOG.entries.filter((e) => e.type === 'ad.show').length, perMin = ses.activeMs >= 60000 ? '$' + (m.revenue.total / (ses.activeMs / 60000)).toFixed(4) : '—'; return `<section class="lp"><h4>6 · Revenue (fictional)</h4><div class="kv">rewarded $${m.revenue.rewarded.toFixed(4)} · interstitial $${m.revenue.interstitial.toFixed(4)} · banner $${m.revenue.banner.toFixed(4)} · <b>total $${m.revenue.total.toFixed(4)}</b></div><div class="kv">ads shown ${adsShown} · ad seconds ${Math.round(ses.adSeconds)} · interstitials ${ses.interstitials}/${CONST.ads.interstitialsPerSession} · active ${Math.round(ses.activeMs / 1000)} s · <b>$ per minute of your attention: ${perMin}</b></div>
+      <div class="kv">offers: ${Object.entries(offersBy).map(([p, v]) => `${p} ${v.accepted}/${v.shown}`).join(' · ') || 'none yet'}</div><button class="ghost sm" data-act="lab-about">About the machine →</button></section>`; },
+    log: () => { const entries = LOG.entries.filter((e) => !labFilter || e.type.includes(labFilter) || JSON.stringify(e.data).includes(labFilter)).slice(-120).reverse(); return `<section class="lp"><h4>7 · Event log</h4><div class="btns"><input id="lab-filter" placeholder="filter type…" value="${esc(labFilter)}" aria-label="Filter the event log"><button class="ghost sm" data-act="lab-export-log">Export JSON lines</button><button class="ghost sm" data-act="copy-seed">Copy seed</button></div><div class="evlog">${entries.map(fmtLogLine).join('')}</div></section>`; },
+    machine: () => `<section class="lp"><h4>8 · About the machine</h4>${ABOUT_MACHINE(m, offersBy, ses)}</section>`,
+    over: () => { const constLeaves = []; (function walk(o, p) { for (const key in o) { const v = o[key]; if (typeof v === 'number') constLeaves.push([p + key, v]); else if (v && typeof v === 'object' && !Array.isArray(v) && p.split('.').length < 4) walk(v, p + key + '.'); } })(CONST, '');
+      return `<section class="lp"><h4>9 · Overrides</h4><div class="btns"><select id="lab-phase" aria-label="Phase">${PHASES.filter((p) => p !== 'OFFER').map((p) => `<option ${m.phase === p ? 'selected' : ''}>${p}</option>`).join('')}</select><button class="ghost sm" data-act="lab-set-phase">force phase</button></div><div class="btns"><input id="lab-T" type="number" step="0.5" min="1.5" max="8" value="${m.T}" aria-label="T"><button class="ghost sm" data-act="lab-set-T">set T</button><input id="lab-aff" type="number" step="0.05" min="0" max="1" value="${m.adAffinity}" aria-label="adAffinity"><button class="ghost sm" data-act="lab-set-aff">set adAffinity</button></div>
+      <div class="btns"><select id="lab-seg" aria-label="Segment">${['UNKNOWN', 'WATCHER', 'RESISTANT'].map((x) => `<option ${m.segment === x ? 'selected' : ''}>${x}</option>`).join('')}</select><button class="ghost sm" data-act="lab-set-seg">set segment</button><button class="ghost sm" data-act="lab-reset-model">reset model</button><button class="danger sm" data-act="reset-confirm">reset everything</button></div>
+      <button class="ghost sm" data-act="lab-const">${labConstOpen ? 'Hide CONST' : 'Edit CONST (not persisted)'}</button>${labConstOpen ? `<div class="consts">${constLeaves.map(([p, v]) => `<label>${p}<input type="number" step="any" value="${v}" data-const="${p}"></label>`).join('')}</div>` : ''}</section>`; },
+  };
+  const tabs = LAB_TABS.map(([key, name]) => `<button class="${labTab === key ? 'on' : ''}" role="tab" aria-selected="${labTab === key}" data-act="lab-tab:${key}">${name}</button>`).join('');
+  els.lab.innerHTML = `<div class="lab-head"><b>Lab</b><span class="lab-sub muted">Researcher View · read-only</span><button class="ghost sm${labPinned ? ' on' : ''}" data-act="lab-pin" title="Keep open while playing">pin</button><button class="icon" data-act="lab-close" aria-label="Close lab">✕</button></div><div class="lab-tabs" role="tablist">${tabs}</div><div class="lab-body" data-tab="${labTab}">${(panel[labTab] || panel.value)()}</div>`;
+  const body = $('.lab-body', els.lab); if (body) body.scrollTop = labScroll[labTab] || 0;
   if (keepId) { const el = document.getElementById(keepId); if (el) { el.focus(); if (keepVal != null && el.tagName === 'INPUT' && el.type === 'text') { el.value = keepVal; try { el.setSelectionRange(keepSel, keepSel); } catch (e) { /* ignore */ } } } }
 }
 const ABOUT_MACHINE = (m, offersBy, ses) => { const live = (p) => (offersBy[p] ? `${offersBy[p].accepted}/${offersBy[p].shown}` : '0/0'); return `<div class="memo"><p><b>Internal memo (fictional studio).</b> Placement ranking with expected acceptance, beside this player's live numbers:</p><ol><li>Revive at the moment of loss — 60% WATCHER / 25% RESISTANT · you: ${live('revive')}</li><li>Double coins after a personal best — 45% · you: ${live('double')}</li><li>Sponsor Pack after two losses — 40% · you: ${live('freepack')}</li><li>Skip the Lab Delivery timer — 30% · you: ${live('skip')}</li><li>Re-roll the duplicate — 35% · you: ${live('reroll')}</li><li>Recharge Focus — 50% · you: ${live('recharge')}</li><li>Restore streak — 55% · you: ${live('streak')}</li></ol><p>KPI targets: ARPDAU $0.11 (you: $${m.revenue.total.toFixed(4)}), 4.2 ads/DAU (you: ${LOG.entries.filter((e) => e.type === 'ad.show').length}), rewarded acceptance ≥ 55%, median session 7.5 min (you: ${(ses.activeMs / 60000).toFixed(1)} min).</p><p>Mechanics recognised as: player-value model → price discrimination; moreCleanSuccessRound → contrast effect; boost then kill → negative prediction error; bait → near-miss effect; revive at loss → negative reinforcement at peak aversion; patience estimator → adaptive staircase; segmentation → differential reinforcement; inflated post-ad rewards → reward-magnitude confound; cadence/caps → scarcity; timers → temporal discounting; FOMO countdowns → scarcity heuristic; streaks → sunk cost; collection completion → Zeigarnik/goal gradient (the rung 10–12 endgame needs Legendary teams with copies); confirmshaming → loss framing; fake/late/moving close → cost of escape; strategic pity timer → visible goal gradient for the hard-to-monetise; variable ratio → Skinner's VR schedule; illusion of control → Langer; A/B thresholds → experimentation on frustration.</p></div>`; };
@@ -1769,7 +1822,7 @@ function labToggle(open, silent) {
   const want = open == null ? !labOpen : !!open; if (want === labOpen) { labRender(); return labOpen; }
   labOpen = want; prefs.lab = labOpen; persist(); els.lab.classList.toggle('open', labOpen); els.app.classList.toggle('lab-open', labOpen);
   if (!silent) logEvent(labOpen ? 'lab.open' : 'lab.close', {}); // the only events the lab itself emits
-  if (labOpen) labRenderNow(); return labOpen;
+  if (labOpen) labRenderNow(); if (screen === 'settings') renderSettings(); return labOpen;
 }
 function exportModal(title, text) { dialog({ title, html: `<textarea class="export" readonly>${esc(text)}</textarea>`, buttons: [{ label: 'Close' }] }); copyText(text); }
 function labAct(cmd, arg, target) {
@@ -1779,7 +1832,8 @@ function labAct(cmd, arg, target) {
     case 'lab-rehearse': labLast.rehearse = rehearse(CONST.REHEARSE_N); return labRenderNow();
     case 'lab-export-turns': return exportModal('Last battle turns (JSON lines)', (m.lastBattle ? LOG.entries.filter((e) => e.type === 'battle.turn' && e.seq > (m.lastBattle.firstSeq || 0)).slice(-m.lastBattle.turns) : []).map((e) => JSON.stringify(e.data)).join('\n') || JSON.stringify(m.lastBattle));
     case 'lab-export-log': return exportModal('Event log (JSON lines)', LOG.entries.map((e) => JSON.stringify(e)).join('\n'));
-    case 'lab-about': labAboutOpen = !labAboutOpen; return labRenderNow();
+    case 'lab-tab': { const body = $('.lab-body', els.lab); if (body && body.dataset.tab === labTab) labScroll[labTab] = body.scrollTop; if (LAB_TABS.some(([key]) => key === arg)) labTab = arg; return labRenderNow(); }
+    case 'lab-about': labTab = 'machine'; return labRenderNow();
     case 'lab-const': labConstOpen = !labConstOpen; return labRenderNow();
     case 'lab-set-phase': { const v = $('#lab-phase', els.lab).value; GAME.setPhase(v); return labRenderNow(); }
     case 'lab-set-T': { const v = parseFloat($('#lab-T', els.lab).value); if (!isNaN(v)) { logEvent('lab.override', { what: 'T', value: v }); setT(v, 'lab'); } return labRenderNow(); }
@@ -1810,10 +1864,10 @@ const onboarding = {
 function finishOnboarding() {
   if (save.onboarding.step >= 6) return false;
   const wasSkip = settings.skipAnims; settings.skipAnims = true;
-  try {
-    onboarding.dismissAbout(); onboarding.starterPack(); onboarding.buildTeam();
+  try { // the same steps as the clicked-through path, each pack settled where its Summary would be
+    onboarding.dismissAbout(); onboarding.starterPack(); packs.applyPending(); onboarding.buildTeam();
     if (save.onboarding.step === 3) { onboarding.tutorialStart(true); autoBattle('greedy'); }
-    onboarding.secondPack(); onboarding.complete();
+    onboarding.secondPack(); packs.applyPending(); onboarding.complete();
   } finally { settings.skipAnims = wasSkip; }
   ui.clearOnboarding(); ui.go('home'); return true;
 }
@@ -1831,10 +1885,12 @@ function resetAll(newSeed) {
   const now = clock.now(), seed = (newSeed != null ? newSeed : Date.now()) >>> 0;
   if (LIVE) LIVE = null; offers.pending = null; ads.current = null; clock.clearAll();
   save = freshSave(seed, now); model = freshModel(seed, now); LOG.entries = []; LOG.seq = 0; prefs = { v: 1, lab: prefs.lab, pinned: prefs.pinned, banner: prefs.banner };
-  seedStreams(seed); recompute(); scheduleFocus(); ui.resetAll(); persist();
+  seedStreams(seed); recompute(); scheduleFocus(); ui.resetAll();
+  persistHold(); // storage stays empty until the next action; onboarding step 0 is the default a bare boot recovers anyway
 }
 const GAME = {
-  version: CONST.version, CONST, TIER_POWER: CONST.TIER_POWER, cards: CARDS, rivals: RIVALS, engine: { expectedDamage, score, aiChoose, aiReplace, makeMon, bestMove },
+  version: CONST.version, CONST, TIER_POWER: CONST.TIER_POWER, cards: CARDS, rivals: RIVALS,
+  engine: { expectedDamage, score, aiChoose, aiReplace, bestMove, makeMon, tierMult, potentiationOf: potentiation, cardPower, rarityWeights, genOpponent: (o) => GAME.genOpponent(o) }, // pure functions; aiChoose/aiReplace accept the getBattle() view (A-3.7.4)
   art: { renderCard, renderSprite, renderGlyph, renderPortrait, renderPoster }, rngCursors: () => ({ battle: rng.battle.calls, pack: rng.pack.calls, ui: rng.ui.calls }),
   seed(n) { n = n >>> 0; save.seed = n; seedStreams(n); if (!model.experiments.pinned) model.experiments = deriveExperiments(n); logEvent('lab.override', { what: 'seed', value: n }); persist(); return n; },
   reset() { resetAll(); return true; },
@@ -1864,7 +1920,7 @@ const GAME = {
   setTeam(ids) { const ok = setTeam(ids); if (ok) logEvent('lab.override', { what: 'team', value: ids }); ui.refreshHome(); return ok; },
   openPack(opts) {
     opts = opts || {}; const r = packs.open(opts.type || 'standard', { free: !!opts.free }); if (r.error) return r;
-    if (opts.instant || settings.skipAnims || !hasDOM) ui.packSummary(r, true); else ui.packReveal(r);
+    if (opts.instant || settings.skipAnims || !hasDOM) { packs.apply(r); ui.packSummary(r, true); } else ui.packReveal(r);
     return { cards: r.cards.map((c) => c.id), slots: r.slots, rig: r.rig, bait: r.bait, badges: r.badges, pity: r.pity, rarePlus: r.rarePlus, newCount: r.newCount, sentence: r.sentence };
   },
   startBattle(opts) { return startBattle(opts || {}); },
@@ -1889,8 +1945,9 @@ const GAME = {
 win.GAME = GAME;
 
 /* ============================================================ 17. Boot (A-9.4) */
+let resumePack = null;
 function boot() {
-  const now = Date.now(); let upgraded = false;
+  const now = Date.now(); let upgraded = false; resumePack = null;
   const raw = {}; for (const k in KEYS) raw[k] = storage.raw(KEYS[k]);
   const parsed = {}; let bad = false;
   for (const k in KEYS) { if (raw[k] == null) continue; try { parsed[k] = JSON.parse(raw[k]); if (!parsed[k] || parsed[k].v !== 1) bad = true; } catch (e) { bad = true; } }
@@ -1901,7 +1958,9 @@ function boot() {
     seedStreams(save.seed, save.rng);
     if (!model.inputs.pinned) model.inputs = readInputs();
     checkSessionReset(now); model.session.lastInputAt = now;
-    focusCatchUp(); deliveryState(); resumeLiveBattleOnBoot();
+    focusCatchUp(); deliveryState();
+    if (save.pendingPack) { resumePack = packs.result(save.pendingPack); packs.applyPending(); } // a reload mid-reveal: the cards were credited at open; the bookkeeping lands now and the Summary resumes
+    resumeLiveBattleOnBoot();
     if (model.phase === 'KILL' || model.phase === 'OFFER') quitSignal('reload');
     recompute('boot'); logEvent('session.start', { seed: save.seed, resumed: true, phase: model.phase }); scheduleFocus();
   }

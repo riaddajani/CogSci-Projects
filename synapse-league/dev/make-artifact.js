@@ -1,10 +1,10 @@
-// make-artifact.js — last build step. Derives synapse-league/artifact.html (the Claude Artifact variant) from
+// make-artifact.js — last build step (run: node dev/make-artifact.js). Derives ../artifact.html (the Claude Artifact variant) from
 // index.html + style.css. The artifact host wraps the file in its own document skeleton, so artifact.html has no
 // doctype/html/head/body of its own: <title>, the claude:viewport-fit meta, ONE inline <style> with all of style.css,
 // the body's inner markup, then the two relative script tags.
 const fs = require('fs');
 const path = require('path');
-const dir = path.join(__dirname, 'synapse-league');
+const dir = path.join(__dirname, '..'); // dev/ lives inside the game folder
 const html = fs.readFileSync(path.join(dir, 'index.html'), 'utf8');
 const css = fs.readFileSync(path.join(dir, 'style.css'), 'utf8');
 const title = /<title>([^<]+)<\/title>/.exec(html)[1].trim();
