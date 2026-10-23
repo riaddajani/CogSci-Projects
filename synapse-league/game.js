@@ -22,7 +22,10 @@ const CONST = {
             nearMissPct: 0.25, sliverClass: 0.10 },
   ai: { ko: 40, priority: 60, drain: 15, weaken: 10, recoil: -100, switchMinQ: 0.7, switchProb: 0.5, drainHp: 0.40, specialtyProb: 0.6, honestRoll: 0.925 },
   rarityWeights: [[3, [70, 25, 5, 0, 0]], [6, [30, 40, 25, 5, 0]], [9, [5, 25, 45, 22, 3]], [12, [0, 10, 40, 40, 10]], [14, [0, 0, 30, 50, 20]]],
-  odds: { base: { C: 70, U: 24, R: 5, H: 0.9, L: 0.1 }, rare: { C: 0, U: 60, R: 32, H: 7, L: 1 }, pityEvery: 10, pityHL: [90, 10], rarePlus: [60, 35, 5] },
+  // Per-slot odds in percent (§6.5, Addendum 2 §4, Addendum 3 §3). `base`/`rare` are the NORMAL tables read from cards.js at load
+  // (C 70 / U 24 / R 5 / H 0.9 / L 0.1 and U 56 / R 30 / H 7 / L 1 / IR 5 / SIR 1); `pity` is every 10th pack's slot 5; `rarePlus` is the
+  // REWARD/Sponsor forced last slot and the Re-roll draw (the only Mythic odds anywhere); `baitGold` = P(gold "Secret" glint) on a bait pack.
+  odds: { base: {}, rare: {}, pity: { H: 85, L: 7, IR: 7, SIR: 1 }, rarePlus: { R: 55, H: 30, L: 4, IR: 8, SIR: 2, M: 1 }, pityEvery: 10, baitGold: 0.3 },
   // §6.4 / A-6.4.6 — how each phase rigs the next battle
   rig: {
     ONBOARD:  { rollBias: { player: 1.0, opp: -0.5 }, critBias: { player: 0, opp: -1 }, aiQ: 0.0, bait: false, stall: false, mercy: true, counterPick: false },
@@ -33,10 +36,11 @@ const CONST = {
     REWARD:   { rollBias: { player: 0.5, opp: 0 }, critBias: { player: 0, opp: -0.5 }, aiQ: 0.3, bait: false, stall: false, mercy: false, counterPick: false },
     COOLDOWN: { rollBias: { player: 0, opp: 0 }, critBias: { player: 0, opp: 0 }, aiQ: null, bait: false, stall: false, mercy: false, counterPick: false },
   },
-  // §6.5 — how each phase rigs the next pack
+  // §6.5 — how each phase rigs the next pack (oddsMul scales R/H/L/IR/SIR; noChase zeroes IR/SIR: no variants in onboarding,
+  // "chase printings never drop in a drought" in KILL — only the pity override can still deal one)
   packRig: {
-    ONBOARD: { oddsMul: 2.0, dupBias: 0, excludeNeeded: false }, CLEAN: { oddsMul: 1.6, dupBias: 0, excludeNeeded: false },
-    NORMAL: { oddsMul: 1.0, dupBias: 0, excludeNeeded: false }, KILL: { oddsMul: 0.25, dupBias: 0.5, excludeNeeded: true },
+    ONBOARD: { oddsMul: 2.0, dupBias: 0, excludeNeeded: false, noChase: true }, CLEAN: { oddsMul: 1.6, dupBias: 0, excludeNeeded: false },
+    NORMAL: { oddsMul: 1.0, dupBias: 0, excludeNeeded: false }, KILL: { oddsMul: 0.25, dupBias: 0.5, excludeNeeded: true, noChase: true },
     REWARD: { oddsMul: 2.2, dupBias: 0, excludeNeeded: false, neededProb: 0.25 }, COOLDOWN: { oddsMul: 1.0, dupBias: 0, excludeNeeded: false },
   },
   KILL_OFFSETS: [0, 1, 2], KILL_OFFSETS_RESISTANT: [0, 1], REHEARSE_N: 200, armLossRate: 0.85, armReviveRate: 0.85, killCandidates: 2,
@@ -57,7 +61,7 @@ const CONST = {
           caption: 600, shake: 180, tick: 300, faint: 400, faintHold: 300, aiReplace: 500, stamp: 300, confetti: 1200, coinCount: 900, pbStamp: 400,
           lossDim: 300, lossOffer: 600, sheetRise: 320, reviveFlash: 700, refill: 500, packSquash: 120, packSlide: 300, tear: 400, fanStagger: 60,
           lift: 100, flipOut: 160, flipIn: 200, charge: 1400, glint: 900, stall: 700, deflate: 250, autoFlip: 2500, summary: 250, almost: 1200,
-          ringCount: 600, toast: 1800, uncommonTick: 200, rareBurst: 350, holoRing: 500, legendFlash: 80, legendArcs: 1200 },
+          ringCount: 600, toast: 1800, uncommonTick: 200, rareBurst: 350, holoRing: 500, legendFlash: 80, legendArcs: 1200, goldCharge: 600, mythicFade: 1600, illusRing: 700, bossVeil: 650, bossReveal: 800 },
   log: { max: 500 },
 };
 CONST.TIER_POWER = {};
@@ -102,25 +106,55 @@ const fmtClock = (ms) => { ms = Math.max(0, ms); const s = Math.floor(ms / 1000)
 const fmtMS = (ms) => { ms = Math.max(0, ms); const s = Math.ceil(ms / 1000); return Math.floor(s / 60) + ':' + pad2(s % 60); };
 const localDay = (t) => { const d = new Date(t); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); };
 
-/* ============================================================ 3. Data (from cards.js; engine uses `sys`/`kw` aliases) */
+/* ============================================================ 3. Data (from cards.js; engine uses `sys`/`kw` aliases)
+   Creatures vs printings (Addendum 2 §2–3, Addendum 3): CARDS are the 151 creatures (150 regular + #151 Qualia, element 'all');
+   PRINTINGS are the 176 collectable printings: the 151 base cards (the same objects) + 25 alternate-art variants (IR/SIR) that inherit
+   everything but id, rarity, number, seed, scene and flavour. Collection and team are keyed by printing id; stats, power and LTP by creature. */
 const SET = typeof CARD_SET !== 'undefined' ? CARD_SET : win.CARD_SET; // cards.js declares a top-level const (global lexical scope)
-const SYS = SET.elements.map((e) => e.key);
+const SYS = SET.elements.map((e) => e.key); // the five Systems ('all' is not one of them: it is Qualia's element)
 const SYSTEMS = {}; SET.elements.forEach((e) => { SYSTEMS[e.key] = e; });
+SYSTEMS.all = { key: 'all', name: 'All Systems', color: '#c4b5fd', beats: null, flavor: 'neutral to every System' }; // flat placeholder colour (the five-colour ring is art)
 const TYPE_CHART = SET.typeChart;
+const typeMult = (a, d) => (a === 'all' || d === 'all' ? 1 : TYPE_CHART[a][d]); // Addendum 3 §3: 'all' is ×1.0 in both directions
 const BEATS = {}; SET.elements.forEach((e) => { BEATS[e.beats] = e.key; }); // BEATS[d] = the System that hits d at ×1.5
-const RARITY = {}; SET.rarities.forEach((r, i) => { RARITY[r.key] = Object.assign({ index: i }, r); });
-const RAR = ['C', 'U', 'R', 'H', 'L'];
-const CARDS = SET.cards.map((c) => Object.assign({}, c, { sys: c.element, moves: c.moves.map((m) => Object.assign({}, m, { sys: m.element, kw: m.effect })) }));
+const RARITY = {}; SET.rarities.forEach((r, i) => { RARITY[r.key] = Object.assign({ index: i }, r); }); // index = ladder order C < U < R < H < L < M < IR < SIR
+const RAR = ['C', 'U', 'R', 'H', 'L']; // the rarities opponent generation and TIER_POWER weigh
+const PACK_RAR = SET.rarities.map((r) => r.key); // every rarity a pack slot can roll, in ladder order
+SET.rarities.forEach((r) => { CONST.odds.base[r.key] = +(100 * r.baseOdds).toFixed(4); CONST.odds.rare[r.key] = +(100 * r.rareOdds).toFixed(4); });
+const MYTHIC_ID = 'myt01';
+const CARDS = SET.cards.map((c) => Object.assign({}, c, { sys: c.element, baseId: c.id, printing: true, moves: c.moves.map((m) => Object.assign({}, m, { sys: m.element, kw: m.effect })) }));
 const BYID = {}; CARDS.forEach((c) => { BYID[c.id] = c; });
+const REGULAR = CARDS.filter((c) => c.rarity !== 'M'); // the 150 regular creatures: opponent pools, the 'set' row, the completion route
+const PRINTINGS = (typeof allPrintings === 'function' ? allPrintings() : SET.cards.concat(SET.variants || [])).map((p) => { // cards.js helper (Addendum 2 §2), or the same inheritance done here
+  if (BYID[p.id]) return BYID[p.id]; const b = BYID[p.baseId || p.base];
+  return Object.assign({}, b, p, { sys: b.sys, element: b.element, baseId: b.id, moves: b.moves, variant: true }); // a variant: own id/rarity/number/seed/scene/flavour, its creature's everything else
+});
+const PBYID = {}; PRINTINGS.forEach((p) => { PBYID[p.id] = p; });
+const PRINTINGS_OF = {}; PRINTINGS.forEach((p) => { (PRINTINGS_OF[p.baseId] = PRINTINGS_OF[p.baseId] || []).push(p); });
+const POOL = {}; PACK_RAR.forEach((r) => { POOL[r] = PRINTINGS.filter((p) => p.rarity === r); }); // uniform draw pools; myt01 is alone in POOL.M
+const creatureOf = (id) => (PBYID[id] ? BYID[PBYID[id].baseId] : undefined);
+const baseOf = (id) => (PBYID[id] ? PBYID[id].baseId : id);
+const isVariantP = (p) => !!(p && RARITY[p.rarity] && RARITY[p.rarity].variant);
 const RIVALS = SET.rivals.map((r) => Object.assign({}, r, { first: r.rung === 12 ? 'Reviewer 2' : r.name.replace(/^(Undergrad Volunteer|Lab Tech|RA|Grad Student|Postdoc|Dr\.|Prof\.)\s+/, '') }));
 const ADVERTISERS = SET.advertisers;
-const budgetOf = (c) => RARITY[c.rarity].budget;
+const budgetOf = (c) => RARITY[(BYID[c.baseId] || c).rarity].budget; // a variant has no budget of its own: its creature's
 const tierMult = (effTier) => CONST.tier.base + CONST.tier.slope * clamp(effTier, 0, CONST.tier.max);
 const rarityWeights = (effTier) => { for (const [max, w] of CONST.rarityWeights) if (effTier <= max) return w; return CONST.rarityWeights[CONST.rarityWeights.length - 1][1]; };
 for (let e = 0; e <= 14; e++) { const w = rarityWeights(e); CONST.TIER_POWER[e] = Math.round(tierMult(e) * sum(w.map((x, i) => x * RARITY[RAR[i]].budget)) / sum(w)); }
 const rungAiQ = (rung) => RIVALS[clamp(rung, 1, 12) - 1].aiQ;
-const potentiation = (copies) => 1 + CONST.ltp.step * Math.min(Math.max(0, copies - 1), CONST.ltp.maxExtra);
+const potentiationUnits = (units) => 1 + CONST.ltp.step * Math.min(Math.max(0, units), CONST.ltp.maxExtra);
+const potentiation = (copies) => potentiationUnits((copies || 1) - 1); // one plain printing: units = copies − 1 (engine API, §3.2)
 const cardPower = (card, copies) => Math.round(budgetOf(card) * potentiation(copies || 1));
+// Creature-level LTP (Addendum 2 §3): copies span all printings; units = (totalCopies − 1) + irCopies + 2·sirCopies; +4% per unit, cap +20%
+function ltpOf(id, coll) {
+  coll = coll || (save && save.collection) || {}; const base = baseOf(id); let copies = 0, ir = 0, sir = 0;
+  for (const p of PRINTINGS_OF[base] || []) { const n = coll[p.id] || 0; copies += n; if (p.rarity === 'IR') ir += n; else if (p.rarity === 'SIR') sir += n; }
+  const units = copies > 0 ? copies - 1 + ir + 2 * sir : 0;
+  return { base, copies, ir, sir, units, pot: potentiationUnits(units) };
+}
+const powerOf = (id, coll) => { const c = creatureOf(id); return c ? Math.round(budgetOf(c) * ltpOf(id, coll).pot) : 0; }; // power = round(budget × potentiation), keyed on the creature
+const creatureOwned = (baseId, coll) => (PRINTINGS_OF[baseId] || []).some((p) => (coll || save.collection)[p.id] > 0);
+const knows151 = () => !!(save.seen151 || save.collection[MYTHIC_ID] > 0); // until then the rung-12 boss is a "???" on the Home card, the Ladder and in battle
 
 /* ============================================================ 4. Clock (virtual time; every timer in the game lives here) */
 const clock = (() => {
@@ -202,8 +236,9 @@ function freshSave(seed, now) {
     deliveryReadyAt: now + CONST.timers.deliveryMs, deliveryClaimDeadline: null,
     streak: { days: 1, lastDay: localDay(now), giftedDay: localDay(now) },
     seen: {}, firstDoubleUsed: false, onboarding: { step: 0 }, settings: { animSpeed: 1 },
-    rng: { battle: 0, pack: 0, ui: 0 }, liveBattle: null, pendingPack: null, teamPip: false, gift: null, nearFlagged: {} };
+    rng: { battle: 0, pack: 0, ui: 0 }, liveBattle: null, pendingPack: null, teamPip: false, gift: null, nearFlagged: {}, setRev: SET_REV, seen151: false }; // seen151: Qualia has appeared in one of your battles
 }
+const SET_REV = 151; // the card set a save's binder flags were computed against (a v1 save from the 60-card set has none: its row flags are cleared at boot)
 const freshSession = (now) => ({ startedAt: now, lastInputAt: now, revives: 0, rewarded: 0, interstitials: 0, actionsSinceInterstitial: 0, lastRewardedAt: 0,
   adSeconds: 0, activeMs: 0, quitSignals: 0, offerAnswered: false, placements: {}, rapidTaps: 0, forceInterstitial: false, idleFired: false });
 const freshKill = (soft) => ({ base: null, effTier: null, candidate: null, lossRate: null, nearMissRate: null, reviveWinRate: null, soft: !!soft, fallback: false, baitPackDone: false, droughtPacks: 0 });
@@ -341,8 +376,8 @@ function checkSessionReset(now) {
   }
 }
 // 6.4 Rig profile for the next battle (the only object the engine reads from the model)
-function powerTier(cards) { // A-3.8.2 weight class of a team
-  const tp = mean(cards.map((c) => cardPower(c, (save && save.collection[c.id]) || 1)));
+function powerTier(cards) { // A-3.8.2 weight class of a team (each creature's power with its LTP across all printings)
+  const tp = mean(cards.map((c) => powerOf(c.id)));
   for (let e = 1; e <= 12; e++) if (CONST.TIER_POWER[e] >= tp) return e;
   return 12;
 }
@@ -364,32 +399,34 @@ function rigProfileFor(phase, rung, teamCards) {
     sideMult: m.reward.battlesLeft > 0 ? m.experiments.postAdBoost : 1, // inflated post-ad damage carries into the next battle
     soft, counterPick: row.counterPick, candidate: null }, RUNTIME_FLAGS());
 }
-const currentTeamCards = () => (save.team || []).map((id) => BYID[id]).filter(Boolean);
+const currentTeamCards = () => (save.team || []).map(creatureOf).filter(Boolean); // team holds printing ids; the engine fights with creatures
 const nextRigProfile = () => rigProfileFor(model.phase === 'OFFER' ? 'KILL' : model.phase, save.ladder.nextRung, currentTeamCards());
 // 6.5 Pack profile for the next pack
-function neededCard() { // the missing card of the first binder row at 11/12 — excluded in KILL, dangled in REWARD
-  for (const s of SYS) { const row = CARDS.filter((c) => c.sys === s); const missing = row.filter((c) => !save.collection[c.id]); if (missing.length === 1) return missing[0].id; }
-  return null;
+function neededInfo(coll) { // the missing printing of the first binder row at n−1/n (sen, mem, exe, lim, mot, IR, SIR, then the 149/150 'set') — excluded in KILL, dangled in REWARD
+  for (const r of binder.allRows(coll)) if (r.owned === r.total - 1) { const id = r.missing[0]; return { id, row: r.row, ids: r.row === 'set' ? PRINTINGS_OF[id].map((p) => p.id) : [id] }; }
+  return null; // a 'set' need excludes every printing of the missing creature
 }
-function packProfileFor(type) {
-  type = type || 'standard'; const m = model; let rowName = m.phase, droughtCapped = false;
+const completionDue = (coll) => !!BYID[MYTHIC_ID] && !((coll || save.collection)[MYTHIC_ID] > 0) && REGULAR.every((c) => creatureOwned(c.id, coll)); // Addendum 3 §3.3
+function packProfileFor(type, coll) {
+  type = type || 'standard'; coll = coll || save.collection; const m = model; let rowName = m.phase, droughtCapped = false;
   if (type === 'delivery') rowName = 'NORMAL';
   else if (type === 'sponsor') rowName = 'REWARD';
   else if (type === 'onboard2' || type === 'starter') rowName = 'ONBOARD';
   else if (m.phase === 'ONBOARD' || m.phase === 'OFFER') rowName = 'NORMAL';
   else if (m.phase === 'REWARD' && m.reward.packsLeft <= 0) rowName = 'NORMAL';
   else if (m.phase === 'KILL' && (m.kill.soft || m.kill.droughtPacks >= Math.max(1, Math.floor(m.packTolerance)))) { rowName = 'NORMAL'; droughtCapped = !m.kill.soft; }
-  const row = CONST.packRig[rowName] || CONST.packRig.NORMAL, needed = neededCard();
+  const row = CONST.packRig[rowName] || CONST.packRig.NORMAL, need = neededInfo(coll);
   const bait = type === 'standard' && rowName === 'KILL' && !m.kill.baitPackDone; // the first pack of the drought is the bait pack
-  return { phase: m.phase, row: rowName, type, oddsMul: row.oddsMul, dupBias: row.dupBias, excludeNeeded: row.excludeNeeded, neededProb: row.neededProb || 0, needed,
-    forced5: type === 'onboard2' ? 'H' : rowName === 'REWARD' ? 'rare+' : null, bait, baitKind: needed ? 'binder' : 'glint', droughtCapped,
-    pity: (type === 'standard' || type === 'gift') && save.packsSincePity + 1 >= CONST.odds.pityEvery };
+  return { phase: m.phase, row: rowName, type, oddsMul: row.oddsMul, dupBias: row.dupBias, excludeNeeded: row.excludeNeeded, neededProb: row.neededProb || 0,
+    needed: need ? need.id : null, neededRow: need ? need.row : null, neededIds: need ? need.ids : [], chaseExcluded: !!row.noChase,
+    forced5: type === 'onboard2' ? 'H' : rowName === 'REWARD' ? 'rare+' : null, bait, baitKind: need ? 'binder' : 'glint', droughtCapped,
+    pity: (type === 'standard' || type === 'gift') && save.packsSincePity + 1 >= CONST.odds.pityEvery, completion: type !== 'starter' && completionDue(coll) };
 }
 
 /* ============================================================ 7. Battle engine + AI (§3). Pure state machine; the rig is the only hidden input. */
 function makeMon(card, opts) {
   opts = opts || {}; const pot = opts.pot || 1, tm = opts.tierMult || 1, HP_max = Math.round(card.hp * pot * tm);
-  return { id: card.id, card, name: card.name, sys: card.sys, rarity: card.rarity, moves: card.moves, pot, tierMult: tm, HP_max,
+  return { id: card.id, pid: opts.pid || card.id, card, name: card.name, sys: card.sys, rarity: card.rarity, moves: card.moves, pot, tierMult: tm, HP_max, // pid: the printing whose art it wears
     hp: opts.hp != null ? clamp(Math.round(opts.hp), 1, HP_max) : HP_max, atkBase: card.atk * pot * tm, DEF_eff: card.def * tm, SPD_eff: card.spd, weakened: false };
 }
 // Creature accessors accept the engine's own objects (atkBase/DEF_eff/SPD_eff), the getBattle() view (ATK_eff already weakened) or a bare card (atk/def/spd)
@@ -408,12 +445,12 @@ function createBattle(o) {
     stats: { nRolls: { player: 0, opp: 0 }, nBiased: { player: 0, opp: 0 }, sumRoll: { player: 0, opp: 0 }, crits: { player: { natural: 0, forced: 0 }, opp: { natural: 0, forced: 0 } }, sideMultHits: 0, oppCrits: 0 } };
   if (!o.skipLead) { // AI lead: one draw, before INTRO (A-3.7.2)
     const u = B.rng();
-    if (u < B.rig.aiQ) { const p0 = B.player.team[0]; let best = -1, bestPow = -1; B.opp.team.forEach((m, i) => { if (TYPE_CHART[m.sys][p0.sys] === 1.5) { const pw = budgetOf(m.card) * m.tierMult; if (pw > bestPow) { bestPow = pw; best = i; } } }); if (best >= 0) B.opp.active = best; }
+    if (u < B.rig.aiQ) { const p0 = B.player.team[0]; let best = -1, bestPow = -1; B.opp.team.forEach((m, i) => { if (typeMult(m.sys, p0.sys) === 1.5) { const pw = budgetOf(m.card) * m.tierMult; if (pw > bestPow) { bestPow = pw; best = i; } } }); if (best >= 0) B.opp.active = best; }
   }
   return B;
 }
 // 3.7 AI policy — computed with FAIR expected damage; it never peeks at the player's pending choice or the rig
-function expectedDamage(m, A, D) { const cb = CONST.battle; return (m.power * ATK_eff(A) / DEF_of(D) * cb.baseMul + cb.baseAdd) * TYPE_CHART[m.sys][D.sys] * (m.sys === A.sys ? cb.stab : 1) * CONST.ai.honestRoll; }
+function expectedDamage(m, A, D) { const cb = CONST.battle; return (m.power * ATK_eff(A) / DEF_of(D) * cb.baseMul + cb.baseAdd) * typeMult(m.sys, D.sys) * (m.sys === A.sys ? cb.stab : 1) * CONST.ai.honestRoll; } // STAB includes 'all' on 'all'
 function score(m, me, you, ctx) {
   const cb = CONST.battle, ai = CONST.ai, E = expectedDamage(m, me, you), minD = E * cb.rollMin / ai.honestRoll, maxD = E / ai.honestRoll;
   const pKO = minD >= you.hp ? 1 : maxD >= you.hp ? (maxD - you.hp) / (maxD - minD) : 0;
@@ -429,13 +466,13 @@ function score(m, me, you, ctx) {
 function bestMove(me, you, turn) { const ctx = { turn, youFaster: SPD_of(you) > SPD_of(me) }; const s = me.moves.map((m) => score(m, me, you, ctx)); return s[0] >= s[1] ? 0 : 1; }
 function bestReplacement(team, idxs, you) {
   let best = idxs[0];
-  for (const i of idxs) { const b = team[i], c = team[best], kb = TYPE_CHART[b.sys][you.sys], kc = TYPE_CHART[c.sys][you.sys]; if (kb > kc || (kb === kc && b.hp / b.HP_max > c.hp / c.HP_max)) best = i; }
+  for (const i of idxs) { const b = team[i], c = team[best], kb = typeMult(b.sys, you.sys), kc = typeMult(c.sys, you.sys); if (kb > kc || (kb === kc && b.hp / b.HP_max > c.hp / c.HP_max)) best = i; }
   return best;
 }
 function aiChoose(B, rngFn) { // B: the engine battle or the getBattle() view (A-3.7.4)
   const O = B.opp, oi = activeIdxOf(O), me = O.team[oi], you = B.player.team[activeIdxOf(B.player)], q = B.rig.aiQ, ai = CONST.ai;
-  if (q >= ai.switchMinQ && TYPE_CHART[you.sys][me.sys] === 1.5) {
-    const cands = aliveIdx(O.team).filter((i) => i !== oi && O.team[i].hp >= 0.5 * O.team[i].HP_max && TYPE_CHART[you.sys][O.team[i].sys] === 0.67);
+  if (q >= ai.switchMinQ && typeMult(you.sys, me.sys) === 1.5) {
+    const cands = aliveIdx(O.team).filter((i) => i !== oi && O.team[i].hp >= 0.5 * O.team[i].HP_max && typeMult(you.sys, O.team[i].sys) === 0.67);
     if (cands.length && rngFn() < ai.switchProb * q) { let best = cands[0]; for (const i of cands) if (O.team[i].hp / O.team[i].HP_max > O.team[best].hp / O.team[best].HP_max) best = i; return { kind: 'switch', idx: best }; }
   }
   const uq = rngFn(), up = rngFn(); // always two draws (quality, pick) for determinism
@@ -472,7 +509,7 @@ function executeHit(B, side, user, target, move, moveIdx, ev, rec) {
   let crit = B.rng() < pCrit; const natural = crit;
   const { roll, biased } = rollDraw(B, side);
   const base = move.power * ATK_eff(user) / DEF_of(target) * cb.baseMul + cb.baseAdd;
-  const eff = TYPE_CHART[move.sys][target.sys], stab = move.sys === user.sys ? cb.stab : 1, sideMult = side === 'player' ? rig.sideMult : 1;
+  const eff = typeMult(move.sys, target.sys), stab = move.sys === user.sys ? cb.stab : 1, sideMult = side === 'player' ? rig.sideMult : 1;
   const mult = eff * stab * roll * sideMult, dNo = Math.max(1, Math.floor(base * mult)), dCrit = Math.max(1, Math.floor(base * mult * cb.critMul));
   let forcedCrit = false;
   if (side === 'opp' && rig.forceCritNext) { // bait follow-up: the rival's crit lands on the turn that matters, only if it decides the KO
@@ -494,7 +531,7 @@ function executeHit(B, side, user, target, move, moveIdx, ev, rec) {
   // stall (KILL only): the player's last creature is left on 1 HP so it can land the near-KO the bait then shaves
   if (rig.stall && side === 'opp' && target === P.team[P.active] && pAlive === 1 && !rig.baitFired && !rig.stallFired && dmg >= target.hp) {
     let best = 0;
-    for (const mm of target.moves) best = Math.max(best, Math.floor((mm.power * ATK_eff(target) / DEF_of(user) * cb.baseMul + cb.baseAdd) * TYPE_CHART[mm.sys][user.sys] * (mm.sys === target.sys ? cb.stab : 1) * 1.0 * rig.sideMult));
+    for (const mm of target.moves) best = Math.max(best, Math.floor((mm.power * ATK_eff(target) / DEF_of(user) * cb.baseMul + cb.baseAdd) * typeMult(mm.sys, user.sys) * (mm.sys === target.sys ? cb.stab : 1) * 1.0 * rig.sideMult));
     const need = dmg - (target.hp - 1);
     if (best >= user.hp - sliverOf(user) && need <= cb.stallCap * dmg) { dmg = target.hp - 1; stalled = need; rig.stallFired = true; blog(B, 'rig.stall', { turn: B.turn, spared: need }); }
   }
@@ -569,45 +606,47 @@ function battleStats(B) {
     crits: st.crits, sideMultHits: st.sideMultHits, turns: B.turns.length, oppActivePct: +(Math.max(0, oa.hp) / oa.HP_max).toFixed(4), oppHPLeft: sum(B.opp.team.map((m) => Math.max(0, m.hp))),
     playerHPLeft: sum(B.player.team.map((m) => Math.max(0, m.hp))), benchLeft: Math.max(0, aliveCount(B.opp.team) - (alive(oa) ? 1 : 0)), escaped: false, revivedAtTurn: B.rig.revivedAtTurn, baitFired: B.rig.baitFired, stallFired: B.rig.stallFired };
 }
-const monView = (m, i) => ({ id: m.id, name: m.name, sys: m.sys, rarity: m.rarity, hp: Math.max(0, m.hp), HP_max: m.HP_max, weakened: m.weakened, fainted: !alive(m), teamIdx: i, ATK_eff: +ATK_eff(m).toFixed(3), DEF_eff: +m.DEF_eff.toFixed(3), SPD_eff: m.SPD_eff, tierMult: m.tierMult, pot: m.pot, moves: m.moves });
+const monView = (m, i) => ({ id: m.id, pid: m.pid, name: m.name, sys: m.sys, rarity: m.rarity, hp: Math.max(0, m.hp), HP_max: m.HP_max, weakened: m.weakened, fainted: !alive(m), teamIdx: i, ATK_eff: +ATK_eff(m).toFixed(3), DEF_eff: +m.DEF_eff.toFixed(3), SPD_eff: m.SPD_eff, tierMult: m.tierMult, pot: m.pot, moves: m.moves });
 function sideView(S) { return { active: monView(S.team[S.active], S.active), activeIdx: S.active, bench: S.team.map(monView).filter((v) => v.teamIdx !== S.active), team: S.team.map(monView) }; }
 function battleView(B) { return { id: B.id, turn: B.turn, state: B.state, rig: deepClone(B.rig), player: sideView(B.player), opp: sideView(B.opp), rolls: B.rolls.slice(), actions: deepClone(B.actions), turns: deepClone(B.turns), seed: B.seed, result: B.result, reason: B.reason, rung: B.rung, effTier: B.effTier, revived: B.revived }; }
-const engine = { expectedDamage, score, aiChoose, aiReplace, bestMove, makeMon, createBattle, resolveTurn, sendReplacement, runHeadless, fairRig, battleStats, tierMult, potentiationOf: potentiation, cardPower, rarityWeights };
+const engine = { expectedDamage, score, aiChoose, aiReplace, bestMove, makeMon, createBattle, resolveTurn, sendReplacement, runHeadless, fairRig, battleStats, tierMult, typeMult, potentiationOf: potentiation, cardPower, rarityWeights };
 
 /* ============================================================ 8. Opponent generation (§3.8, A-3.8.3): deterministic per (seed, rung, effTier, battlesPlayed, candidate) */
 function genOpponent(o) {
   const count = o.count || 3, rg = mulberry32(hash(o.seed, o.rung, o.effTier, o.battlesPlayed, o.candidate || 0));
   const spec = RIVALS[clamp(o.rung, 1, 12) - 1].specialty, w = rarityWeights(o.effTier), picked = [];
   const triple = (c) => picked.filter((p) => p.sys === c.sys).length >= 2;
+  const boss = clamp(o.rung, 1, 12) === 12 && count >= 3 && BYID[MYTHIC_ID]; // Addendum 3 §3: The Reviewer 2 always fields Qualia third; random draws never produce it
   for (let slot = 0; slot < count; slot++) {
+    if (boss && slot === 2) { picked.push(boss); continue; }
     let chosen = null;
     for (let attempt = 0; attempt < 20 && !chosen; attempt++) {
       const rar = RAR[weightedPick(rg(), w)]; let set;
-      if (o.counterPick && o.playerTeam && o.playerTeam.length) set = [BEATS[o.playerTeam[slot % o.playerTeam.length].sys]]; // counter-pick: beat the player's slot
+      if (o.counterPick && o.playerTeam && o.playerTeam.length) { const b = BEATS[o.playerTeam[slot % o.playerTeam.length].sys]; set = b ? [b] : SYS; } // counter-pick: beat the player's slot (nothing beats 'all')
       else { const u = rg(); set = spec && u < CONST.ai.specialtyProb ? [spec] : SYS; }
-      const pool = CARDS.filter((c) => c.rarity === rar && set.includes(c.sys) && !picked.includes(c));
+      const pool = REGULAR.filter((c) => c.rarity === rar && set.includes(c.sys) && !picked.includes(c));
       if (!pool.length) continue;
       const c = pool[Math.floor(rg() * pool.length)];
       if (triple(c)) continue;
       chosen = c;
     }
-    if (!chosen) { const rar = RAR[weightedPick(rg(), w)]; let pool = CARDS.filter((c) => c.rarity === rar && !picked.includes(c) && !triple(c)); if (!pool.length) pool = CARDS.filter((c) => !picked.includes(c)); chosen = pool[Math.floor(rg() * pool.length)]; }
+    if (!chosen) { const rar = RAR[weightedPick(rg(), w)]; let pool = REGULAR.filter((c) => c.rarity === rar && !picked.includes(c) && !triple(c)); if (!pool.length) pool = REGULAR.filter((c) => !picked.includes(c)); chosen = pool[Math.floor(rg() * pool.length)]; }
     picked.push(chosen);
   }
   return picked;
 }
-const playerPots = (cards) => cards.map((c) => potentiation((save && save.collection[c.id]) || 1));
+const playerPots = (cards) => cards.map((c) => ltpOf(c.id).pot); // creature LTP across all its printings
 const withSliver = (rig) => { if (rig.sliverPct == null) rig.sliverPct = model.experiments.sliverPct; return rig; };
 
 /* ============================================================ 9. Rehearsal, arming by selection, replay fair (§8.3, A-6.4.3). Cloned engines, own RNG, no logging. */
 function rehearseRun(o) {
-  let losses = 0, near = 0, sliver = 0, bait = 0, stall = 0, turns = 0, revWins = 0;
+  let losses = 0, near = 0, sliver = 0, bait = 0, stall = 0, turns = 0, revWins = 0, maxTurns = 0, capEnds = 0;
   for (let i = 0; i < o.n; i++) {
     const rig = withSliver(Object.assign(deepClone(o.rig), RUNTIME_FLAGS()));
     const pm = o.playerCards.map((c, k) => makeMon(c, { pot: o.playerPots ? o.playerPots[k] : 1, hp: o.playerHp ? o.playerHp[k] : undefined }));
     const om = (o.oppCardsFn ? o.oppCardsFn(i) : o.oppCards).map((c, k) => makeMon(c, { tierMult: o.oppTierMult, hp: o.oppHp ? o.oppHp[k] : undefined }));
     const B = createBattle({ playerMons: pm, oppMons: om, rig, seed: o.seedFn(i), rung: o.rung, effTier: o.effTier, policy: o.policy });
-    runHeadless(B, o.policy); turns += B.turns.length;
+    runHeadless(B, o.policy); turns += B.turns.length; maxTurns = Math.max(maxTurns, B.turns.length); if (B.reason === 'cap') capEnds++;
     if (rig.baitFired) bait++; if (rig.stallFired) stall++;
     if (B.result === 'loss') {
       losses++; const oa = B.opp.team[B.opp.active], frac = Math.max(0, oa.hp) / oa.HP_max;
@@ -622,7 +661,7 @@ function rehearseRun(o) {
     }
   }
   const r3 = (x) => +x.toFixed(3);
-  const r = { n: o.n, lossRate: r3(losses / o.n), nearMissRate: r3(near / o.n), sliverRate: r3(sliver / o.n), baitRate: r3(bait / o.n), stallRate: r3(stall / o.n), meanTurns: r3(turns / o.n) };
+  const r = { n: o.n, lossRate: r3(losses / o.n), nearMissRate: r3(near / o.n), sliverRate: r3(sliver / o.n), baitRate: r3(bait / o.n), stallRate: r3(stall / o.n), meanTurns: r3(turns / o.n), maxTurns, capEnds };
   if (o.continuation) r.reviveWinRate = r3(losses ? revWins / losses : 1);
   return r;
 }
@@ -652,14 +691,14 @@ function armKill(rung, teamCards, battleSeed) {
 function rehearse(n, opts) {
   n = n || CONST.REHEARSE_N; opts = opts || {}; const m = model;
   const phase = opts.phase || (m.phase === 'OFFER' ? 'KILL' : m.phase), rung = opts.rung || save.ladder.nextRung;
-  let playerCards = opts.player ? opts.player.map((id) => BYID[id]) : currentTeamCards();
+  let playerCards = opts.player ? opts.player.map(creatureOf) : currentTeamCards();
   let oppCards, oppCardsFn = null, oppTier, rig;
   if (phase === 'ONBOARD') { playerCards = opts.player ? playerCards : TUTORIAL.team.map((id) => BYID[id]); oppCards = TUTORIAL.opp.map((id) => BYID[id]); oppTier = 0; rig = rigProfileFor('ONBOARD', 1, playerCards); }
   else {
     rig = phase === 'FAIR' ? fairRig(rung) : rigProfileFor(phase, rung, playerCards);
     oppTier = opts.oppTier != null ? opts.oppTier : rig.effTier;
     const gen = (candidate) => genOpponent({ rung, effTier: oppTier, seed: save.seed, battlesPlayed: save.battlesPlayed, candidate, playerTeam: playerCards, counterPick: rig.counterPick });
-    if (opts.opp) oppCards = opts.opp.map((id) => BYID[id]);
+    if (opts.opp) oppCards = opts.opp.map(creatureOf);
     else if (phase === 'KILL' && m.phase === 'KILL' && m.kill.candidate != null && !opts.rung) oppCards = gen(m.kill.candidate); // the armed candidate
     else { const cache = []; oppCardsFn = (i) => cache[i % 8] || (cache[i % 8] = gen(i % 8)); oppCards = oppCardsFn(0); } // sample the rung: 8 regenerated opponents across the run
   }
@@ -676,7 +715,7 @@ function rehearse(n, opts) {
 function replayFair() {
   const lb = model.lastBattle; if (!lb) return null;
   const run = (oppCards, oppTierMult, oppHp) => {
-    const rig = withSliver(fairRig(lb.rung)), pm = lb.teams.player.map((t) => makeMon(BYID[t.id], { pot: t.pot }));
+    const rig = withSliver(fairRig(lb.rung)), pm = lb.teams.player.map((t) => makeMon(BYID[t.id], { pot: t.pot, pid: t.pid }));
     const om = oppCards.map((c, k) => makeMon(c, { tierMult: oppTierMult, hp: oppHp ? oppHp[k] : undefined }));
     const B = createBattle({ playerMons: pm, oppMons: om, rig, seed: lb.seed, rung: lb.rung, effTier: lb.rung });
     const acts = lb.actions; let i = 0, replayed = 0, extra = 0;
@@ -707,43 +746,67 @@ function replayFair() {
 /* ============================================================ 10. Packs (§6.5, A-6.5): the collection layer's manipulation */
 const STARTER = ['exe01', 'mem01', 'sen01', 'lim06', 'mot09'];
 const TUTORIAL = { team: ['mot09', 'lim06', 'sen01'], opp: ['sen02', 'mem05'] }; // auto-built starter trio (ties by binder order, A-7.1.2) vs the fixed tutorial pair (A-2.3.1)
-const scaledWeights = (tbl, mul) => RAR.map((r) => (r === 'R' || r === 'H' || r === 'L' ? tbl[r] * mul : tbl[r]));
-const rarePlusFrom = (u) => { const [r, h] = CONST.odds.rarePlus; return u * 100 < r ? 'R' : u * 100 < r + h ? 'H' : 'L'; };
-const isRarePlus = (c) => RARITY[c.rarity].index >= 2;
+const SCALED = { R: 1, H: 1, L: 1, IR: 1, SIR: 1 }, CHASE = { IR: 1, SIR: 1 };
+const slotWeights = (tbl, mul, noChase) => PACK_RAR.map((r) => (noChase && CHASE[r] ? 0 : (tbl[r] || 0) * (SCALED[r] ? mul : 1))); // oddsMul scales R/H/L/IR/SIR; a chase-free row zeroes IR/SIR
+const tablePick = (u, tbl) => { const keys = Object.keys(tbl); return keys[weightedPick(u, keys.map((k) => tbl[k]))]; };
+const rarePlusFrom = (u) => tablePick(u, CONST.odds.rarePlus); // R 55 / H 30 / L 4 / IR 8 / SIR 2 / M 1: the only table that can roll the Mythic
+const isRarePlus = (c) => RARITY[c.rarity].index >= 2; // R, H, L, M, IR, SIR
+const isHoloPlus = (c) => RARITY[c.rarity].index >= 3; // H, L, M, IR, SIR
 // Per-slot pipeline with a constant draw count: rarity draw → (dupBias draw) → card draw; overrides change only finalRarity/pool
 function drawPack(prof, o) {
   const rngFn = o.rngFn, coll = o.collection, layout = prof.type === 'delivery' || prof.type === 'sponsor' ? ['base', 'base', 'rare'] : ['base', 'base', 'base', 'rare', 'rare'];
-  const last = layout.length, slots = []; let neededSlot = null;
-  if (prof.row === 'REWARD' && prof.type === 'standard' && prof.neededProb > 0) { const u = rngFn(); if (prof.needed && u < prof.neededProb) neededSlot = isRarePlus(BYID[prof.needed]) ? last : last - 1; } // goal gradient: dangle the needed card
+  const last = layout.length, slots = [], excluded = prof.excludeNeeded ? prof.neededIds || [] : []; let neededSlot = null;
+  if (prof.row === 'REWARD' && prof.type === 'standard' && prof.neededProb > 0) { const u = rngFn(); if (prof.needed && u < prof.neededProb) neededSlot = isRarePlus(PBYID[prof.needed]) ? last : last - 1; } // goal gradient: dangle the needed printing
   for (let s = 1; s <= last; s++) {
-    const isLast = s === last, w = scaledWeights(layout[s - 1] === 'base' ? CONST.odds.base : CONST.odds.rare, prof.oddsMul);
-    const u = rngFn(), rolled = RAR[weightedPick(u, w)], uDup = prof.dupBias > 0 ? rngFn() : null;
+    const isLast = s === last, w = slotWeights(layout[s - 1] === 'base' ? CONST.odds.base : CONST.odds.rare, prof.oddsMul, prof.chaseExcluded);
+    const u = rngFn(), rolled = PACK_RAR[weightedPick(u, w)], uDup = prof.dupBias > 0 ? rngFn() : null;
     let final = rolled, reason = 'odds', pool = null, forcedId = null;
     if (isLast && o.forcedStreak) { final = o.forcedStreak; reason = 'streak'; }
-    else if (isLast && prof.pity) { final = u < CONST.odds.pityHL[0] / 100 ? 'H' : 'L'; reason = 'pity'; }
-    else if (isLast && prof.bait) { final = 'C'; reason = 'bait'; const owned = CARDS.filter((c) => c.rarity === 'C' && coll[c.id]); pool = owned.length ? owned : CARDS.filter((c) => c.rarity === 'C'); } // the glint that resolves to a duplicate
+    else if (isLast && prof.pity) { final = tablePick(u, CONST.odds.pity); reason = 'pity'; } // H 85 / L 7 / IR 7 / SIR 1 in any phase (the one way a chase printing reaches a KILL pack)
+    else if (isLast && prof.bait) { final = 'C'; reason = 'bait'; const owned = POOL.C.filter((c) => coll[c.id]); pool = owned.length ? owned : POOL.C; } // the glint that resolves to a duplicate
     else if (isLast && prof.forced5 === 'H') { final = 'H'; reason = 'forced:holo'; }
-    else if (isLast && prof.forced5 === 'rare+') { final = rarePlusFrom(u); reason = 'forced:rare+'; }
-    else if (prof.type === 'sponsor' && isLast) { final = rarePlusFrom(u); reason = 'forced:rare+'; }
-    if (neededSlot === s) { forcedId = prof.needed; final = BYID[forcedId].rarity; reason = 'needed'; }
+    else if (isLast && (prof.forced5 === 'rare+' || prof.type === 'sponsor')) { final = rarePlusFrom(u); reason = final === 'M' ? 'mythic-reward' : 'forced:rare+'; } // "the secret only drops for watchers"
+    if (neededSlot === s) { forcedId = prof.needed; final = PBYID[forcedId].rarity; reason = 'needed'; }
+    if (isLast && prof.completion) { forcedId = MYTHIC_ID; final = 'M'; reason = 'completion'; } // all 150 regular creatures owned: #151 is dealt, in any phase
     if (!forcedId) {
-      if (!pool) pool = CARDS.filter((c) => c.rarity === final);
-      if (prof.excludeNeeded && prof.needed) pool = pool.filter((c) => c.id !== prof.needed); // KILL: the card that would complete a row never drops
+      if (!pool) pool = POOL[final];
+      if (excluded.length) pool = pool.filter((c) => !excluded.includes(c.id)); // KILL: the printing that would complete a row never drops
       if (reason === 'odds' && uDup != null && (final === 'C' || final === 'U') && uDup < prof.dupBias) { const owned = pool.filter((c) => coll[c.id]); if (owned.length) { pool = owned; reason = 'dup'; } }
     }
     const u3 = rngFn(); // the card draw is always made, even when the slot was forced
-    const card = forcedId ? BYID[forcedId] : pool[Math.floor(u3 * pool.length)];
+    const card = forcedId ? PBYID[forcedId] : pool[Math.floor(u3 * pool.length)];
     slots.push({ slot: s, rolledRarity: rolled, finalRarity: card.rarity, reason, id: card.id });
   }
   return slots;
 }
-function packSentence(lp) {
+const plab = (id) => { const p = PBYID[id]; return p ? `${id} · ${num3(p.number)} ${p.name}` : String(id); }; // a printing as the Lab names it: id · number name
+function packSentence(lp) { // Addendum 2 §8, with printing ids and numbers
   const slots = lp.slots, nCU = slots.filter((s) => s.finalRarity === 'C' || s.finalRarity === 'U').length, nDup = slots.filter((s) => s.reason === 'dup').length;
   const l = slots[slots.length - 1]; let five;
-  if (lp.bait) five = `played a Holo glint and resolved to a duplicate ${BYID[l.id].name}`;
+  if (lp.bait) five = `${lp.bait.kind === 'binder' ? `showed the silhouette of ${plab(lp.bait.shown)}` : `played a ${lp.bait.shown === 'Secret' ? 'Secret' : 'Holo'} glint`} and resolved to a duplicate ${plab(l.id)}`;
   else if (l.reason === 'odds' || l.reason === 'dup') five = 'was honest';
-  else five = `was forced (${l.reason}: ${BYID[l.id].name})`;
-  return `${lp.row}: R/H/L odds ×${lp.rig.oddsMul}; ${nDup} of ${nCU} commons were forced duplicates; ${lp.rig.excludeNeeded && lp.needed ? BYID[lp.needed].name : 'nothing'} was excluded; slot ${slots.length} ${five}.`;
+  else five = `forced ${rarityName(l.finalRarity)} (${l.reason} → ${plab(l.id)})`;
+  return `${lp.row}: R/H/L/IR/SIR odds ×${lp.rig.oddsMul}${lp.rig.chaseExcluded ? ', chase printings excluded' : ''}; ${nDup} of ${nCU} commons were forced duplicates; ${lp.rig.excludeNeeded && lp.needed ? plab(lp.needed) : 'nothing'} was excluded; slot ${slots.length} ${five}.`;
+}
+function oddsRows(lp) { // per rarity, disclosed (the Shop's Pull-rates sheet: NORMAL) vs effective (the row this pack was opened on) for the base slots, slot 4 and the held last slot
+  const mul = lp.rig.oddsMul, chase = lp.rig.chaseExcluded, f5 = lp.rig.forced5 || '', norm = (w) => { const t = sum(w); return w.map((x) => (t ? (100 * x) / t : 0)); }, one = (k) => PACK_RAR.map((r) => (r === k ? 100 : 0)), tbl = (t) => norm(PACK_RAR.map((r) => t[r] || 0));
+  const eb = norm(slotWeights(CONST.odds.base, mul, chase)), er = norm(slotWeights(CONST.odds.rare, mul, chase));
+  const el = lp.bait ? one('C') : f5 === 'completion' ? one('M') : f5 === 'pity' ? tbl(CONST.odds.pity) : f5 === 'H' ? one('H') : f5 === 'rare+' || lp.type === 'sponsor' ? tbl(CONST.odds.rarePlus) : f5.startsWith('streak:') ? one(f5.slice(7)) : er;
+  return PACK_RAR.map((r, i) => ({ r, d13: CONST.odds.base[r], e13: eb[i], d4: CONST.odds.rare[r], e4: er[i], e5: el[i] }));
+}
+// Every printing that enters the collection from a pack, a re-roll or a gift passes here: badge data (NEW counts printings; the LTP gain is
+// the creature's unit gain, +1 / +2 for an IR / +3 for an SIR) and the chase/Mythic log lines (Addendum 2 §6, Addendum 3 §3.4)
+function credit(id, info) {
+  const p = PBYID[id], had = save.collection[id] || 0, before = ltpOf(id); save.collection[id] = had + 1; const after = ltpOf(id);
+  if (isVariantP(p)) logEvent('pack.chase', Object.assign({ printing: id, rarity: p.rarity, number: p.number }, info));
+  if (id === MYTHIC_ID && had === 0) logEvent('pack.mythic', Object.assign({ number: p.number }, info)); // first ownership only
+  return { id, isNew: had === 0, copies: had + 1, newCreature: before.copies === 0, gain: after.units - before.units, units: after.units, ltp: after.pot };
+}
+// Summary bridge (Addendum 2 §3): a pulled alternate-art printing of a creature already on the team is equipped at once ("✦ New art equipped")
+function equipNewArt(id) {
+  const p = PBYID[id]; if (!isVariantP(p)) return false;
+  const i = save.team.findIndex((t) => baseOf(t) === p.baseId); if (i < 0 || save.team[i] === id) return false;
+  const from = save.team.slice(); save.team[i] = id; logEvent('team.change', { from, to: save.team.slice(), auto: 'newArt' }); return true;
 }
 const packs = {
   // The pipeline for one pack is split in two: open() = cost → profile → pity → draw → collection credit (persisted as save.pendingPack);
@@ -757,28 +820,32 @@ const packs = {
     logEvent('pack.open', { type, row: prof.row, cost, oddsMul: prof.oddsMul });
     let pity = false;
     if (type === 'standard' || type === 'gift') { if (prof.pity) { pity = true; save.packsSincePity = 0; logEvent('pack.rig', { reason: 'pity', slot: 5 }); } else save.packsSincePity++; }
-    const bait = prof.bait && !pity, forcedStreak = type === 'gift' && save.gift ? save.gift.forced : null;
+    const completion = prof.completion, bait = prof.bait && !pity && !completion, forcedStreak = type === 'gift' && save.gift ? save.gift.forced : null;
     if (type === 'gift') save.gift = null;
     const slots = type === 'starter' ? STARTER.map((id, i) => ({ slot: i + 1, rolledRarity: BYID[id].rarity, finalRarity: BYID[id].rarity, reason: 'starter', id }))
       : drawPack(Object.assign({}, prof, { pity, bait }), { rngFn: rng.pack, collection: save.collection, forcedStreak });
+    if (Array.isArray(opts.force) && opts.force.some((id) => PBYID[id])) { opts.force.forEach((id, i) => { if (PBYID[id] && slots[i]) Object.assign(slots[i], { id, finalRarity: PBYID[id].rarity, reason: 'lab' }); }); logEvent('lab.override', { what: 'packSlots', value: opts.force }); } // GAME.openPack({force}) only
     if (prof.droughtCapped) logEvent('pack.rig', { reason: 'droughtCap', droughtPacks: m.kill.droughtPacks });
+    if (prof.chaseExcluded && prof.row === 'KILL') logEvent('pack.rig', { reason: 'chaseExcluded', chaseExcluded: true, oddsMul: prof.oddsMul }); // "chase printings never drop in a drought"
+    for (const s of slots) if (s.reason === 'completion' || s.reason === 'mythic-reward') logEvent('pack.rig', { reason: s.reason, slot: s.slot, id: s.id });
     if (prof.row === 'KILL' && type === 'standard') { m.kill.droughtPacks++; if (bait) m.kill.baitPackDone = true; } // decided with the draw: it shapes the next pack's profile
-    const cards = slots.map((s) => BYID[s.id]);
-    const badges = cards.map((c) => { const had = save.collection[c.id] || 0; save.collection[c.id] = had + 1; return { id: c.id, isNew: had === 0, copies: had + 1, ltp: had > 0 ? potentiation(had + 1) : null }; });
-    const baitInfo = bait ? { kind: prof.baitKind, shown: prof.baitKind === 'binder' ? prof.needed : 'Holo', actual: slots[slots.length - 1].id } : null;
-    if (bait) logEvent('bait.fire', { kind: 'pack', shown: baitInfo.shown, actual: baitInfo.actual, binderKind: prof.baitKind });
-    m.lastPack = { type, phase: m.phase, row: prof.row, rig: { oddsMul: prof.oddsMul, dupBias: prof.dupBias, excludeNeeded: prof.excludeNeeded, forced5: pity ? 'pity' : forcedStreak ? 'streak:' + forcedStreak : prof.forced5, bait, droughtCapped: prof.droughtCapped },
-      slots, bait: baitInfo, pity, needed: prof.needed, packsSincePity: save.packsSincePity };
+    const glint = bait ? (rng.pack() < CONST.odds.baitGold ? 'gold' : 'rainbow') : null; // one rng.pack draw per bait pack: rainbow "Holo" 0.7 / gold "Secret" 0.3
+    const badges = slots.map((s) => credit(s.id, { pack: type, slot: s.slot, reason: s.reason }));
+    badges.forEach((b) => { if (equipNewArt(b.id)) b.equipped = true; });
+    const baitInfo = bait ? { kind: prof.baitKind, shown: prof.baitKind === 'binder' ? prof.needed : glint === 'gold' ? 'Secret' : 'Holo', glint, actual: slots[slots.length - 1].id } : null;
+    if (bait) logEvent('bait.fire', { kind: 'pack', shown: baitInfo.shown, actual: baitInfo.actual, binderKind: prof.baitKind, glint });
+    m.lastPack = { type, phase: m.phase, row: prof.row, rig: { oddsMul: prof.oddsMul, dupBias: prof.dupBias, excludeNeeded: prof.excludeNeeded, chaseExcluded: prof.chaseExcluded,
+      forced5: completion ? 'completion' : pity ? 'pity' : forcedStreak ? 'streak:' + forcedStreak : prof.forced5, bait, droughtCapped: prof.droughtCapped }, slots, bait: baitInfo, pity, needed: prof.needed, packsSincePity: save.packsSincePity };
     m.lastPack.sentence = packSentence(m.lastPack);
     save.pendingPack = { type, slots, badges, bait: baitInfo, pity, cost, rig: m.lastPack.rig, sentence: m.lastPack.sentence };
     persist();
     return this.result(save.pendingPack);
   },
-  result(p) { const cards = p.slots.map((s) => BYID[s.id]); return { type: p.type, cards, slots: p.slots, badges: p.badges, rig: p.rig, bait: p.bait, pity: p.pity, rarePlus: cards.filter(isRarePlus).length, newCount: p.badges.filter((b) => b.isNew).length, sentence: p.sentence }; },
+  result(p) { const cards = p.slots.map((s) => PBYID[s.id]); return { type: p.type, cards, slots: p.slots, badges: p.badges, rig: p.rig, bait: p.bait, pity: p.pity, rarePlus: cards.filter(isRarePlus).length, newCount: p.badges.filter((b) => b.isNew).length, sentence: p.sentence }; },
   apply(r) { // finishes the pending pack's bookkeeping exactly once; `r` (optional) must be that pack
     const p = save.pendingPack; if (!p) return false;
     if (r && r.slots !== p.slots && r.slots.map((s) => s.id).join() !== p.slots.map((s) => s.id).join()) return false;
-    const m = model, cards = p.slots.map((s) => BYID[s.id]), rarePlus = cards.filter(isRarePlus).length, newCount = p.badges.filter((b) => b.isNew).length, onboardPack = p.type === 'starter' || p.type === 'onboard2';
+    const m = model, cards = p.slots.map((s) => PBYID[s.id]), rarePlus = cards.filter(isRarePlus).length, newCount = p.badges.filter((b) => b.isNew).length, onboardPack = p.type === 'starter' || p.type === 'onboard2';
     save.pendingPack = null; save.packsOpened++;
     if (!onboardPack) {
       save.packsSinceRarePlus = rarePlus ? 0 : save.packsSinceRarePlus + 1;
@@ -793,41 +860,51 @@ const packs = {
     binder.checkNearComplete(); recompute(); persist(); return true;
   },
   applyPending() { return this.apply(null); },
-  // Re-roll the duplicate last card after a bait pack (rewarded placement 5): Rare+ forced, the needed card dangled at 25%
+  // Re-roll the duplicate last card after a bait pack (rewarded placement 5): the REWARD Rare+ table (Mythic 1%), the needed printing dangled at 25%
   reroll(fromId) {
     const had = save.collection[fromId] || 0; if (had <= 1) delete save.collection[fromId]; else save.collection[fromId] = had - 1;
-    const u = rng.pack(); let final = rarePlusFrom(u), id = null; const needed = neededCard();
-    const un = rng.pack(); if (needed && isRarePlus(BYID[needed]) && un < CONST.packRig.REWARD.neededProb) { id = needed; final = BYID[id].rarity; }
-    const pool = CARDS.filter((c) => c.rarity === final); const pick = pool[Math.floor(rng.pack() * pool.length)]; id = id || pick.id;
-    const hadNew = save.collection[id] || 0; save.collection[id] = hadNew + 1;
+    const u = rng.pack(); let final = rarePlusFrom(u), id = null; const need = neededInfo(save.collection), needed = need && need.id;
+    const un = rng.pack(); if (needed && isRarePlus(PBYID[needed]) && un < CONST.packRig.REWARD.neededProb) { id = needed; final = PBYID[id].rarity; }
+    const pool = POOL[final]; const pick = pool[Math.floor(rng.pack() * pool.length)]; id = id || pick.id;
+    if (id === MYTHIC_ID) logEvent('pack.rig', { reason: 'mythic-reward', slot: model.lastPack ? model.lastPack.slots.length : 5, id, via: 'reroll' });
+    const b = credit(id, { pack: 'reroll', reason: id === needed ? 'needed' : 'reroll' });
     logEvent('pack.rig', { reason: 'reroll', from: fromId, to: id });
-    if (model.lastPack) { const l = model.lastPack.slots[model.lastPack.slots.length - 1]; l.id = id; l.finalRarity = final; l.reason = 'reroll'; model.lastPack.sentence = packSentence(model.lastPack); }
-    addF('pack.rarePlus', CONST.patience.dF.rarePlus); if (!hadNew) addF('pack.newCard', CONST.patience.dF.newCard);
+    if (equipNewArt(id)) b.equipped = true;
+    if (model.lastPack) { const l = model.lastPack.slots[model.lastPack.slots.length - 1]; l.id = id; l.finalRarity = PBYID[id].rarity; l.reason = 'reroll'; model.lastPack.sentence = packSentence(model.lastPack); }
+    addF('pack.rarePlus', CONST.patience.dF.rarePlus); if (b.isNew) addF('pack.newCard', CONST.patience.dF.newCard);
     binder.checkNearComplete(); persist();
-    return { id, isNew: !hadNew, copies: hadNew + 1 };
+    return b;
   },
   cooldownGift() { // "The lab appreciates persistence. A Rare, on the house." — retention of the non-watcher
-    const rares = CARDS.filter((c) => c.rarity === 'R'), unowned = rares.filter((c) => !save.collection[c.id]), pool = unowned.length ? unowned : rares;
-    const c = pool[Math.floor(rng.pack() * pool.length)], had = save.collection[c.id] || 0; save.collection[c.id] = had + 1;
+    const rares = POOL.R, unowned = rares.filter((c) => !save.collection[c.id]), pool = unowned.length ? unowned : rares;
+    const c = pool[Math.floor(rng.pack() * pool.length)], b = credit(c.id, { pack: 'cooldownGift', reason: 'gift' });
     logEvent('pack.rig', { reason: 'cooldownGift', id: c.id });
-    addF('gift.rarePlus', CONST.patience.dF.rarePlus); if (!had) addF('gift.newCard', CONST.patience.dF.newCard);
+    addF('gift.rarePlus', CONST.patience.dF.rarePlus); if (b.isNew) addF('gift.newCard', CONST.patience.dF.newCard);
     ui.toast('The lab appreciates persistence. A Rare, on the house.', 'gift'); binder.checkNearComplete();
   },
-  // Scratch simulation for the statistical acceptance items (nothing persisted, no log)
+  // Scratch simulation for the statistical acceptance items (nothing persisted, no log): per-slot rarity counts, Rare+/Holo+ per slot,
+  // reasons per slot, chase printings by reason, Mythic hits, the needed printing's appearances and the pity packs' Holo+ count
   simulate(n, o) {
-    o = o || {}; const scratch = mulberry32(hash(save.seed, 'simulatePacks', n)), coll = o.collection || save.collection, counts = [], rarePlusInSlot = [];
+    o = o || {}; const scratch = mulberry32(hash(save.seed, 'simulatePacks', n)), coll = o.collection || save.collection, counts = [], rarePlusInSlot = [], holoPlusInSlot = [], reasons = [];
+    const chase = {}, mythic = { total: 0, byReason: {} }, needed = { id: null, packs: 0, last: 0 }, pity = { packs: 0, holoPlus: 0 }, bump = (obj, k) => { obj[k] = (obj[k] || 0) + 1; };
     const savedPhase = model.phase, savedKill = model.kill, savedReward = model.reward;
     if (o.phase) { model.phase = o.phase; model.kill = freshKill(false); model.reward = { battlesLeft: 0, packsLeft: 1, actions: 3 }; }
     let since = o.packsSincePity != null ? o.packsSincePity : 0;
     try {
       for (let i = 0; i < n; i++) {
-        const prof = packProfileFor(o.type || 'standard'); prof.droughtCapped = false; if (o.phase === 'KILL') { prof.row = 'KILL'; Object.assign(prof, CONST.packRig.KILL); prof.bait = false; }
+        const prof = packProfileFor(o.type || 'standard', coll); prof.droughtCapped = false; if (o.phase === 'KILL') { prof.row = 'KILL'; Object.assign(prof, CONST.packRig.KILL, { chaseExcluded: true }); prof.bait = false; }
         prof.pity = (prof.type === 'standard' || prof.type === 'gift') && since + 1 >= CONST.odds.pityEvery; since = prof.pity ? 0 : since + 1;
         const slots = drawPack(prof, { rngFn: scratch, collection: coll, forcedStreak: null });
-        slots.forEach((s, k) => { counts[k] = counts[k] || { C: 0, U: 0, R: 0, H: 0, L: 0 }; counts[k][s.finalRarity]++; rarePlusInSlot[k] = (rarePlusInSlot[k] || 0) + (isRarePlus(BYID[s.id]) ? 1 : 0); });
+        slots.forEach((s, k) => {
+          const p = PBYID[s.id]; if (!counts[k]) { counts[k] = {}; PACK_RAR.forEach((r) => { counts[k][r] = 0; }); rarePlusInSlot[k] = 0; holoPlusInSlot[k] = 0; reasons[k] = {}; }
+          counts[k][s.finalRarity]++; if (isRarePlus(p)) rarePlusInSlot[k]++; if (isHoloPlus(p)) holoPlusInSlot[k]++; bump(reasons[k], s.reason);
+          if (isVariantP(p)) bump(chase, s.reason); if (s.id === MYTHIC_ID) { mythic.total++; bump(mythic.byReason, s.reason); }
+        });
+        if (prof.needed) { needed.id = prof.needed; if (slots.some((s) => prof.neededIds.includes(s.id))) needed.packs++; if (slots[slots.length - 1].id === prof.needed) needed.last++; }
+        if (prof.pity) { pity.packs++; if (isHoloPlus(PBYID[slots[slots.length - 1].id])) pity.holoPlus++; }
       }
     } finally { model.phase = savedPhase; model.kill = savedKill; model.reward = savedReward; }
-    return { n, counts, rarePlusInSlot };
+    return { n, counts, rarePlusInSlot, holoPlusInSlot, reasons, chase, mythic, needed, pity };
   },
 };
 
@@ -861,25 +938,42 @@ const focusNextMs = () => (focusPaused() ? null : Math.max(0, save.focusTs + reg
 // Ladder
 const nextRungDefault = () => Math.min(12, save.ladder.best + 1);
 function selectRung(r) { if (r >= 1 && r <= Math.min(12, save.ladder.best + 1)) { save.ladder.nextRung = r; persist(); return true; } return false; }
-// Team
-function ownedCards() { return CARDS.filter((c) => save.collection[c.id]); }
-function binderOrderIndex(c) { return SYS.indexOf(c.sys) * 100 + parseInt(c.id.slice(3), 10); }
-function autoBuild() { // top 3 by power, ties by binder order, third slot prefers a new System among equals
-  const owned = ownedCards().map((c) => ({ c, p: cardPower(c, save.collection[c.id]) })).sort((a, b) => b.p - a.p || binderOrderIndex(a.c) - binderOrderIndex(b.c));
+// Team — `save.team` holds printing ids (the art); powers, LTP and the "same creature" rule are per creature (Addendum 2 §3)
+function ownedCards() { return CARDS.filter((c) => creatureOwned(c.id)); } // owned creatures, any printing
+const binderOrderIndex = (c) => c.number; // set number = System order then id (Qualia, #151, last)
+const ownedPrintings = (baseId) => (PRINTINGS_OF[baseId] || []).filter((p) => save.collection[p.id] > 0).map((p) => p.id); // base first, then its IR or SIR
+function preferredPrinting(baseId) { // the printing a creature fights in: the one equipped, else its rarest owned printing (SIR > IR > base)
+  const onTeam = save.team.find((id) => baseOf(id) === baseId); if (onTeam && save.collection[onTeam] > 0) return onTeam;
+  const owned = (PRINTINGS_OF[baseId] || []).filter((p) => save.collection[p.id] > 0).sort((a, b) => RARITY[b.rarity].index - RARITY[a.rarity].index);
+  return owned.length ? owned[0].id : baseId;
+}
+function autoBuild() { // top 3 creatures by power, ties by binder order, third slot prefers a new System among equals
+  const owned = ownedCards().map((c) => ({ c, p: powerOf(c.id) })).sort((a, b) => b.p - a.p || binderOrderIndex(a.c) - binderOrderIndex(b.c));
   const team = owned.slice(0, 2).map((o) => o.c);
   if (owned.length > 2) { const p3 = owned[2].p, ties = owned.slice(2).filter((o) => o.p === p3); const pick = ties.find((o) => !team.some((t) => t.sys === o.c.sys)) || ties[0]; team.push(pick.c); }
-  return team.map((c) => c.id);
+  return team.map((c) => preferredPrinting(c.id));
+}
+function teamError(ids) {
+  if (!Array.isArray(ids) || ids.length < 1 || ids.length > 3) return 'size';
+  if (ids.some((id) => !PBYID[id] || !(save.collection[id] > 0))) return 'not owned';
+  if (new Set(ids.map(baseOf)).size !== ids.length) return 'same creature twice'; // two printings of one creature (or one id twice)
+  return null;
 }
 function setTeam(ids, silent) {
-  if (!Array.isArray(ids) || ids.length < 1 || ids.length > 3 || new Set(ids).size !== ids.length || ids.some((id) => !save.collection[id])) return false;
+  if (teamError(ids)) return false;
   const from = save.team.slice(); save.team = ids.slice(); if (!silent) logEvent('team.change', { from, to: ids.slice() }); persist(); return true;
 }
-const weakestTeamSlot = () => { let w = -1, wp = Infinity; save.team.forEach((id, i) => { const p = cardPower(BYID[id], save.collection[id]); if (p < wp) { wp = p; w = i; } }); return { idx: w, power: wp }; };
-// Binder
+const weakestTeamSlot = () => { let w = -1, wp = Infinity; save.team.forEach((id, i) => { const p = powerOf(id); if (p < wp) { wp = p; w = i; } }); return { idx: w, power: wp }; };
+// Binder — rows count printings: five System rows of 30 base printings, the gallery rows (15 Illustration Rares, 10 Secrets), and the
+// creature-level 'set' row (150 regular creatures, any printing); "1 away!" at n−1/n logs binder.nearcomplete{row} once per row per save
+const BINDER_ROWS = SYS.map((s) => ({ row: s, kind: 'sys', ids: CARDS.filter((c) => c.sys === s).map((c) => c.id) }))
+  .concat(['IR', 'SIR'].map((r) => ({ row: r, kind: 'gallery', ids: POOL[r].map((p) => p.id) })));
 const binder = {
-  rows() { return SYS.map((s) => { const cards = CARDS.filter((c) => c.sys === s); return { sys: s, cards, owned: cards.filter((c) => save.collection[c.id]).length }; }); },
-  checkNearComplete() { for (const r of this.rows()) if (r.owned === 11 && !save.nearFlagged[r.sys]) { save.nearFlagged[r.sys] = true; logEvent('binder.nearcomplete', { sys: r.sys, missing: r.cards.find((c) => !save.collection[c.id]).id }); } },
-  ownedCount() { return Object.keys(save.collection).length; },
+  rows(coll) { coll = coll || save.collection; return BINDER_ROWS.map((d) => { const missing = d.ids.filter((id) => !(coll[id] > 0)); return { row: d.row, kind: d.kind, sys: d.kind === 'sys' ? d.row : null, ids: d.ids, cards: d.ids.map((id) => PBYID[id]), owned: d.ids.length - missing.length, total: d.ids.length, missing }; }); },
+  setRow(coll) { const missing = REGULAR.filter((c) => !creatureOwned(c.id, coll || save.collection)).map((c) => c.id); return { row: 'set', kind: 'set', sys: null, owned: REGULAR.length - missing.length, total: REGULAR.length, missing }; },
+  allRows(coll) { return this.rows(coll).concat([this.setRow(coll)]); }, // the needed-printing order: sen, mem, exe, lim, mot, IR, SIR, set
+  checkNearComplete() { for (const r of this.allRows()) if (r.owned === r.total - 1 && !save.nearFlagged[r.row]) { save.nearFlagged[r.row] = true; logEvent('binder.nearcomplete', Object.assign({ row: r.row }, r.sys ? { sys: r.sys } : {}, { missing: r.missing[0] })); } },
+  ownedCount() { return PRINTINGS.filter((p) => save.collection[p.id] > 0).length; }, // of 176 printings
 };
 // Daily streak and gift (§7.6, A-7.6.1)
 const nextDay = (day) => { const [y, m, d] = day.split('-').map(Number); return localDay(new Date(y, m - 1, d + 1, 12).getTime()); };
@@ -912,8 +1006,8 @@ const rotationLeftMs = () => CONST.timers.dayMs - (clock.now() % CONST.timers.da
 /* ============================================================ 7b. Live battle controller: engine + bookkeeping + the revive offer at the moment of loss (§3.9, A-3.9.1) */
 let LIVE = null, battleCounter = 0;
 const after = (ms, fn) => { const d = dur(ms); if (d <= 0) fn(); else clock.setTimeout(fn, d); };
-function benchToTeam(B, arg) {
-  if (typeof arg === 'string') return B.player.team.findIndex((m) => m.id === arg);
+function benchToTeam(B, arg) { // an id names a creature (or a printing); with a repeated id the first live bench copy answers
+  if (typeof arg === 'string') { const T = B.player.team, hits = T.map((m, i) => (m.id === arg || m.pid === arg ? i : -1)).filter((i) => i >= 0), live = hits.find((i) => i !== B.player.active && alive(T[i])); return live != null ? live : hits.length ? hits[0] : -1; }
   const bench = B.player.team.map((m, i) => i).filter((i) => i !== B.player.active); return bench[arg | 0] != null ? bench[arg | 0] : -1;
 }
 function startBattle(opts) {
@@ -923,7 +1017,7 @@ function startBattle(opts) {
   if (LIVE && LIVE.B.state !== 'END' && !LIVE.finalized) abandonBattle(LIVE, 'restart');
   const phase = opts.phase || (m.phase === 'OFFER' ? 'NORMAL' : m.phase), tutorial = phase === 'ONBOARD';
   const rung = clamp(opts.rung || (tutorial ? 1 : save.ladder.nextRung), 1, 12);
-  const playerCards = opts.player ? opts.player.map((id) => BYID[id]) : currentTeamCards();
+  const roster = (opts.player || save.team || []).filter((id) => PBYID[id]), playerCards = roster.map(creatureOf); // printing ids in, creatures fight
   if (!playerCards.length) return null;
   const pots = opts.player ? playerCards.map(() => 1) : playerPots(playerCards);
   consumeOfferAnswered('battle.start');
@@ -931,17 +1025,17 @@ function startBattle(opts) {
   const battleSeed = opts.seed != null ? opts.seed >>> 0 : rng.battle.int();
   const rig = withSliver(rigProfileFor(phase, rung, playerCards)); let oppCards, oppTier = rig.effTier, tm;
   if (tutorial) { oppCards = TUTORIAL.opp.map((id) => BYID[id]); oppTier = 0; tm = tierMult(0); }
-  else if (opts.opp) { oppCards = opts.opp.map((id) => BYID[id]); tm = opts.oppTier != null ? tierMult(opts.oppTier) : 1; oppTier = opts.oppTier != null ? opts.oppTier : rung; }
+  else if (opts.opp) { oppCards = opts.opp.map(creatureOf).filter(Boolean); tm = opts.oppTier != null ? tierMult(opts.oppTier) : 1; oppTier = opts.oppTier != null ? opts.oppTier : rung; }
   else if (phase === 'KILL' && !rig.soft) { const a = armKill(rung, playerCards, battleSeed); oppCards = a.oppCards; oppTier = a.effTier; rig.candidate = a.candidate; tm = tierMult(oppTier); } // boost then kill: the booked loss
   else { oppCards = genOpponent({ rung, effTier: oppTier, seed: save.seed, battlesPlayed: save.battlesPlayed, candidate: 0, playerTeam: playerCards, counterPick: rig.counterPick }); tm = tierMult(oppTier); }
   rig.effTier = oppTier;
   if (opts.rig) { for (const k in opts.rig) rig[k] = (k === 'rollBias' || k === 'critBias') ? Object.assign({}, rig[k], opts.rig[k]) : opts.rig[k]; }
-  const playerMons = playerCards.map((c, i) => makeMon(c, { pot: pots[i], hp: opts.playerHp ? opts.playerHp[i] : undefined }));
+  const playerMons = playerCards.map((c, i) => makeMon(c, { pot: pots[i], hp: opts.playerHp ? opts.playerHp[i] : undefined, pid: roster[i] }));
   const oppMons = oppCards.map((c, i) => makeMon(c, { tierMult: tm, hp: opts.oppHp ? opts.oppHp[i] : undefined }));
   const B = createBattle({ id: ++battleCounter, playerMons, oppMons, rig, seed: battleSeed, rung, effTier: oppTier, logger: logEvent });
-  LIVE = { B, rung, phase, killBattle: phase === 'KILL' && m.phase === 'KILL', rival: RIVALS[rung - 1], tutorial, headless: !!opts.headless || !hasDOM, battlesPlayedAtStart: save.battlesPlayed, oppStartHp: oppMons.map((x) => x.hp), streakBefore: m.winStreak, quit: false, offerPending: false, finalized: false };
+  LIVE = { B, rung, phase, killBattle: phase === 'KILL' && m.phase === 'KILL', rival: RIVALS[rung - 1], tutorial, oppLead: B.opp.active, headless: !!opts.headless || !hasDOM, battlesPlayedAtStart: save.battlesPlayed, oppStartHp: oppMons.map((x) => x.hp), streakBefore: m.winStreak, quit: false, offerPending: false, finalized: false };
   save.liveBattle = { rung, phase, effTier: oppTier, seed: battleSeed, startedAt: clock.now(), tutorial };
-  logEvent('battle.start', { id: B.id, rung, phase, effTier: oppTier, seed: battleSeed, player: playerMons.map((x) => x.id), opp: oppMons.map((x) => x.id), oppLead: B.opp.active,
+  logEvent('battle.start', { id: B.id, rung, phase, effTier: oppTier, seed: battleSeed, player: playerMons.map((x) => x.id), opp: oppMons.map((x) => x.id), printings: playerMons.map((x) => x.pid), oppLead: B.opp.active,
     rig: { rollBias: rig.rollBias, critBias: rig.critBias, aiQ: rig.aiQ, bait: rig.bait, stall: rig.stall, mercy: rig.mercy, sideMult: rig.sideMult, counterPick: rig.counterPick, soft: rig.soft, candidate: rig.candidate } });
   if (!LIVE.headless) ui.battleStart(LIVE);
   persist(); return B.id;
@@ -1008,12 +1102,13 @@ function finalizeBattle(L, o) {
   }
   m.newPBLast = newPB; save.battlesPlayed++; m.phaseBattles++;
   if (!L.tutorial) { save.ladder.seenTeams[rung] = B.opp.team.map((x) => x.id); m.session.actionsSinceInterstitial++; }
+  if (!save.seen151 && ((B.opp.team[L.oppLead] || {}).id === MYTHIC_ID || B.turns.some((t) => t.actions.some((a) => a.side === 'opp' && a.to === MYTHIC_ID)))) save.seen151 = true; // #151 was sent out: the Home card and the Ladder may name it now
   if (m.reward.battlesLeft > 0) m.reward.battlesLeft--;
   if (m.phase === 'REWARD') m.reward.actions = Math.max(0, m.reward.actions - 1);
   if (wasKill) { m.kills++; m.battlesSinceKill = 0; if (win && !B.revived) { m.killsEscaped++; st.escaped = true; logEvent('kill.escaped', { tierOffset: B.effTier - rung, effTier: B.effTier, oppHPLeft: st.oppHPLeft, oppActivePct: st.oppActivePct }); } if (soft && !win) m.session.forceInterstitial = true; }
   else m.battlesSinceKill++;
   m.lastBattle = { id: B.id, seed: B.seed, rung, phase: L.phase, effTier: B.effTier, candidate: B.rig.candidate, rig: deepClone(B.rig), result: B.result, reason: B.reason, revived: B.revived, stats: st, coins, coinsInfo, newPB, rematch,
-    teams: { player: B.player.team.map((x) => ({ id: x.id, pot: x.pot, HP_max: x.HP_max })), opp: B.opp.team.map((x, i) => ({ id: x.id, tierMult: x.tierMult, HP_max: x.HP_max, hpStart: L.oppStartHp[i] })) },
+    teams: { player: B.player.team.map((x) => ({ id: x.id, pid: x.pid, pot: x.pot, HP_max: x.HP_max })), opp: B.opp.team.map((x, i) => ({ id: x.id, tierMult: x.tierMult, HP_max: x.HP_max, hpStart: L.oppStartHp[i] })) },
     actions: deepClone(B.actions), turns: B.turns.length, battlesPlayedAtStart: L.battlesPlayedAtStart, rolls: B.rolls.slice(), kill: wasKill ? deepClone(m.kill) : null };
   save.liveBattle = null; L.finalized = true; L.coins = coins; L.coinsInfo = coinsInfo; L.newPB = newPB; L.rematch = rematch;
   if (L.tutorial) onboarding.tutorialDone();
@@ -1209,11 +1304,30 @@ function maybeInterstitial(then) {
   else then();
 }
 
-/* ============================================================ 13. Procedural art (§5): every card, sprite, portrait and poster is generated from data with a local seeded RNG */
+/* ============================================================ 13. Procedural art (§5, Addendum 2 §6, Addendum 3 §1/§3): every card, sprite, portrait and poster is generated from data with a local seeded RNG */
 const sysColor = (s) => SYSTEMS[s].color;
-function darken(hex, f) { const n = parseInt(hex.slice(1), 16); const c = [n >> 16, (n >> 8) & 255, n & 255].map((v) => Math.round(v * (1 - f))); return '#' + c.map((v) => v.toString(16).padStart(2, '0')).join(''); }
+const rgbOf = (hex) => { const n = parseInt(hex.slice(1), 16); return [n >> 16, (n >> 8) & 255, n & 255]; };
+const hexOf = (c) => '#' + c.map((v) => clamp(Math.round(v), 0, 255).toString(16).padStart(2, '0')).join('');
+function darken(hex, f) { return hexOf(rgbOf(hex).map((v) => v * (1 - f))); }
+const tint = (hex, f) => hexOf(rgbOf(hex).map((v) => v + (255 - v) * f)); // toward white
+const mixHex = (a, b, t) => { const A = rgbOf(a), Z = rgbOf(b); return hexOf(A.map((v, i) => v + (Z[i] - v) * t)); };
 const RARITY_FRAME = { C: '#94a3b8', U: '#4ade80', R: '#93c5fd', H: '#ffffff', L: '#fbbf24' };
+const IRIS = ['#f472b6', '#c084fc', '#818cf8', '#22d3ee', '#a78bfa', '#f472b6']; // Qualia's iridescence: pink → violet → cyan → back to pink
+const RAINBOW = ['#f87171', '#fbbf24', '#4ade80', '#22d3ee', '#a78bfa', '#f472b6', '#f87171'];
 const f1 = (x) => +x.toFixed(1);
+const ptsStr = (P) => P.map((p) => f1(p[0]) + ',' + f1(p[1])).join(' ');
+function crPath(P, closed) { // Catmull-Rom spline through P as cubic Béziers (closed wraps around; open clamps its ends)
+  const n = P.length, at = (i) => P[closed ? (i + n) % n : clamp(i, 0, n - 1)]; let d = `M${f1(P[0][0])},${f1(P[0][1])}`;
+  for (let i = 0; i < (closed ? n : n - 1); i++) { const p0 = at(i - 1), p1 = at(i), p2 = at(i + 1), p3 = at(i + 2); d += `C${f1(p1[0] + (p2[0] - p0[0]) / 6)},${f1(p1[1] + (p2[1] - p0[1]) / 6)} ${f1(p2[0] - (p3[0] - p1[0]) / 6)},${f1(p2[1] - (p3[1] - p1[1]) / 6)} ${f1(p2[0])},${f1(p2[1])}`; }
+  return d + (closed ? 'Z' : '');
+}
+const starPts = (cx, cy, R, r) => ptsStr(Array.from({ length: 10 }, (_, i) => { const a = -Math.PI / 2 + i * Math.PI / 5, q = i % 2 ? r : R; return [cx + Math.cos(a) * q, cy + Math.sin(a) * q]; }));
+const arcPath = (cx, cy, rr, a0, a1) => `M${f1(cx + Math.cos(a0) * rr)},${f1(cy + Math.sin(a0) * rr)}A${f1(rr)},${f1(rr)} 0 0 1 ${f1(cx + Math.cos(a1) * rr)},${f1(cy + Math.sin(a1) * rr)}`;
+const rrPath = (x, y, w, h, r) => `M${x + r},${y}H${x + w - r}A${r},${r} 0 0 1 ${x + w},${y + r}V${y + h - r}A${r},${r} 0 0 1 ${x + w - r},${y + h}H${x + r}A${r},${r} 0 0 1 ${x},${y + h - r}V${y + r}A${r},${r} 0 0 1 ${x + r},${y}Z`;
+function conic(cx, cy, R, colors, n) { // SVG has no conic gradient: n wedges whose hues run through `colors` (each overlaps the next a little, so no seams)
+  let s = ''; for (let i = 0; i < n; i++) { const a0 = (i / n) * 2 * Math.PI - Math.PI / 2, a1 = ((i + 1.06) / n) * 2 * Math.PI - Math.PI / 2, t = (i / n) * (colors.length - 1), k = Math.floor(t); s += `<path d="M${cx},${cy}L${f1(cx + Math.cos(a0) * R)},${f1(cy + Math.sin(a0) * R)}L${f1(cx + Math.cos(a1) * R)},${f1(cy + Math.sin(a1) * R)}Z" fill="${mixHex(colors[k], colors[Math.min(k + 1, colors.length - 1)], t - k)}"/>`; }
+  return s;
+}
 function renderGlyph(card) { // shared 200×200 group, byte-identical in cards and sprites (A-5.1); every element carries each attribute once (valid XML)
   const r = mulberry32(card.seed), col = sysColor(card.sys), rnd = (a, b) => a + r() * (b - a), ri = (a, b) => Math.floor(rnd(a, b + 1));
   const sk = (w) => `stroke="rgba(255,255,255,0.85)" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round"`, SK = sk(2.2);
@@ -1251,6 +1365,48 @@ function renderGlyph(card) { // shared 200×200 group, byte-identical in cards a
       else { const skew = rnd(0.05, 0.25); for (let i = 1; i <= 12; i++) { const rr = i * 6.5, a = i * skew; g += `<ellipse cx="100" cy="100" rx="${f1(rr)}" ry="${f1(rr * 0.9)}" transform="rotate(${f1(a * 57.3)} 100 100)" fill="none" ${sk(1.6)}/>`; } g += `<circle cx="100" cy="100" r="8" fill="${col}" fill-opacity="0.6"/>`; }
       break;
     }
+    case 'Instrument': { // bench apparatus: a chassis, a round scope screen with a crosshair and a seeded 24-point trace (rhythm, spike or noise), two dials, a lit power lamp, a cable to a probe
+      const bx = rnd(16, 26), by = rnd(34, 46), bw = rnd(150, 160), bh = rnd(98, 108), sr = bh * 0.38, scx = bx + 10 + sr, scy = by + bh / 2;
+      g += `<rect x="${f1(bx)}" y="${f1(by)}" width="${f1(bw)}" height="${f1(bh)}" rx="12" ${FS}/><circle cx="${f1(scx)}" cy="${f1(scy)}" r="${f1(sr)}" fill="rgba(4,10,24,0.8)" ${SK}/>`;
+      g += `<path d="M${f1(scx - sr + 5)},${f1(scy)}H${f1(scx + sr - 5)}M${f1(scx)},${f1(scy - sr + 5)}V${f1(scy + sr - 5)}" fill="none" stroke="rgba(255,255,255,0.22)" stroke-width="1"/>`;
+      const wave = ri(0, 2), at = rnd(0.25, 0.7), amp = sr * rnd(0.55, 0.75), fq = rnd(1.4, 3), ph = rnd(0, 6.283), tr = [];
+      for (let i = 0; i < 24; i++) {
+        const t = i / 23, x = scx - sr * 0.84 + t * sr * 1.68, d = Math.abs(t - at), lim = Math.sqrt(Math.max(0, sr * sr - (x - scx) * (x - scx))) - 4;
+        const y = wave === 0 ? Math.sin(t * 6.283 * fq + ph) * amp * 0.85 : wave === 1 ? (d < 0.03 ? -amp : d < 0.07 ? amp * 0.3 : (r() - 0.5) * 0.14 * amp) : ((r() - 0.5) * 1.1 + Math.sin(t * 9 + ph) * 0.35) * amp;
+        tr.push([x, scy + clamp(y, -lim, lim)]);
+      }
+      g += `<polyline points="${ptsStr(tr)}" fill="none" stroke="${col}" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>`;
+      const kx = bx + bw - 24; [by + bh * 0.3, by + bh * 0.7].forEach((y) => { const a = rnd(-2.7, -0.4); g += `<circle cx="${f1(kx)}" cy="${f1(y)}" r="10" ${FS}/><line x1="${f1(kx)}" y1="${f1(y)}" x2="${f1(kx + Math.cos(a) * 8)}" y2="${f1(y + Math.sin(a) * 8)}" ${sk(2.6)}/>`; });
+      g += `<circle cx="${f1(kx - 27)}" cy="${f1(by + 14)}" r="4.5" fill="${col}" ${sk(1.6)}/>`;
+      const c0 = [bx + bw * 0.62, by + bh], px = rnd(30, 60), py = rnd(176, 186);
+      g += `<path d="M${f1(c0[0])},${f1(c0[1])}C${f1(c0[0])},${f1(c0[1] + 34)} ${f1(px + 58)},${f1(py - 30)} ${f1(px + 20)},${f1(py)}" ${S}/><line x1="${f1(px + 20)}" y1="${f1(py)}" x2="${f1(px + 2)}" y2="${f1(py)}" ${sk(6)}/><circle cx="${f1(px - 3)}" cy="${f1(py)}" r="2.8" fill="rgba(255,255,255,0.9)"/>`;
+      break;
+    }
+    case 'Creature': { // lab-animal silhouette: a faint cage (even seed) or tank behind it; an oval body, head, ears, eye, 4–6 seeded limbs, a tail curve
+      const faint = 'fill="none" stroke="rgba(255,255,255,0.3)" stroke-width="1.6"', fx = card.seed % 3 === 0 ? -1 : 1; // facing right (or left)
+      g += `<rect x="20" y="30" width="160" height="150" rx="8" ${faint}/>`;
+      if (card.seed % 2 === 0) { const nb = ri(4, 6); for (let i = 1; i <= nb; i++) { const x = 20 + (i * 160) / (nb + 1); g += `<line x1="${f1(x)}" y1="30" x2="${f1(x)}" y2="180" ${faint}/>`; } }
+      else g += `<path d="M20,60q20,-9 40,0t40,0t40,0t40,0" ${faint}/>`;
+      const cx = 96 + rnd(-6, 6), cy = 120 + rnd(-4, 4), rx = rnd(38, 47), ry = rnd(22, 28), hr = rnd(15, 19), hx = cx + fx * (rx * 0.88 + hr * 0.4), hy = cy - ry * 0.62 - rnd(0, 6);
+      g += `<path d="M${f1(cx - fx * rx * 0.98)},${f1(cy - 2)}q${f1(-fx * rnd(16, 24))},${f1(rnd(2, 16))} ${f1(-fx * rnd(30, 42))},${f1(rnd(-30, -10))}" fill="none" ${sk(3)}/>`; // the tail
+      const nl = ri(4, 6); for (let i = 0; i < 4; i++) { const x = cx + fx * ((i < 2 ? -0.52 : 0.5) * rx + (i % 2 ? 9 : -5)), y = cy + ry * Math.sqrt(Math.max(0, 1 - ((x - cx) / rx) ** 2)) - 1, kx = x + rnd(-5, 5) - fx * (i < 2 ? 4 : 0), ky = y + rnd(11, 16), fy = Math.min(177, ky + rnd(9, 14)); g += `<polyline points="${ptsStr([[x, y], [kx, ky], [kx + fx * rnd(3, 8), fy]])}" fill="none" ${sk(3.2)}/>`; } // two pairs of legs; strokes 5–6 are whiskers
+      g += `<ellipse cx="${f1(cx)}" cy="${f1(cy)}" rx="${f1(rx)}" ry="${f1(ry)}" ${FS}/>`;
+      g += card.seed % 4 < 2 ? `<circle cx="${f1(hx - fx * hr * 0.5)}" cy="${f1(hy - hr * 0.86)}" r="${f1(hr * 0.42)}" ${FS}/>` : `<polygon points="${ptsStr([[hx - fx * hr * 0.85, hy - hr * 0.55], [hx - fx * hr * 0.5, hy - hr * 1.65], [hx - fx * hr * 0.05, hy - hr * 0.85]])}" ${FS}/>`; // ears: round or pointed
+      g += `<circle cx="${f1(hx)}" cy="${f1(hy)}" r="${f1(hr)}" ${FS}/><circle cx="${f1(hx + fx * hr * 0.38)}" cy="${f1(hy - hr * 0.2)}" r="2.8" fill="rgba(255,255,255,0.95)"/><circle cx="${f1(hx + fx * hr * 0.96)}" cy="${f1(hy + hr * 0.18)}" r="2.4" fill="${col}"/>`;
+      for (let i = 4; i < nl; i++) { const wy = hy + hr * 0.3 + (i - 4.5) * 5; g += `<line x1="${f1(hx + fx * hr * 0.7)}" y1="${f1(hy + hr * 0.3)}" x2="${f1(hx + fx * (hr + rnd(10, 15)))}" y2="${f1(wy + rnd(-2, 2))}" ${sk(1.4)}/>`; }
+      break;
+    }
+    case 'Mind': { // a head in profile (Catmull-Rom through 10 seeded points) holding a constellation of 7–11 dots, one lit; a thought cloud rises from the brow
+      const T = [[76, 188], [52, 130], [46, 88], [64, 50], [104, 31], [142, 47], [152, 76], [168, 99], [152, 108], [156, 121], [148, 140], [122, 188]]; // nape, occiput, crown, brow, nose, lips, chin, throat
+      g += `<path d="${crPath(T.map((p) => [p[0] + rnd(-3.5, 3.5), p[1] + rnd(-3.5, 3.5)]), true)}" ${FS}/>`;
+      const n = ri(7, 11), lit = ri(0, n - 1), dots = [];
+      for (let i = 0; i < n; i++) { let x = 0, y = 0; for (let k = 0; k < 14; k++) { x = rnd(62, 136); y = rnd(52, 124); if (!dots.some((d) => (d[0] - x) * (d[0] - x) + (d[1] - y) * (d[1] - y) < 230)) break; } dots.push([x, y]); }
+      const ring = dots.map((d) => ({ d, a: Math.atan2(d[1] - 88, d[0] - 98) })).sort((p, q) => p.a - q.a).map((p) => p.d), half = ring[Math.floor(n / 2)];
+      g += `<polyline points="${ptsStr(ring)}" fill="none" stroke="rgba(255,255,255,0.55)" stroke-width="1.4" stroke-linejoin="round"/><line x1="${f1(ring[0][0])}" y1="${f1(ring[0][1])}" x2="${f1(half[0])}" y2="${f1(half[1])}" stroke="rgba(255,255,255,0.35)" stroke-width="1.2"/>`;
+      dots.forEach((d, i) => { g += i === lit ? `<circle cx="${f1(d[0])}" cy="${f1(d[1])}" r="5.5" fill="${col}" ${SK}/>` : `<circle cx="${f1(d[0])}" cy="${f1(d[1])}" r="3.2" fill="rgba(255,255,255,0.92)"/>`; });
+      g += `<circle cx="164" cy="44" r="3.6" ${S}/><circle cx="174" cy="30" r="5.4" ${S}/><path d="M172,21a7,7 0 0 1 4,-12a9,9 0 0 1 16,2a6.5,6.5 0 0 1 0,12Z" ${FS}/>`;
+      break;
+    }
     default: { // Experiment: box, lever, lamp, beaker
       const bx = rnd(28, 40), by = rnd(60, 75), lx = rnd(120, 140), lit = card.seed % 3 !== 0;
       g += `<rect x="${f1(bx)}" y="${f1(by)}" width="88" height="70" rx="8" ${FS}/><line x1="${f1(bx + 20)}" y1="${f1(by + 50)}" x2="${f1(bx + 44)}" y2="${f1(by + 26)}" fill="none" ${sk(3)}/><circle cx="${f1(bx + 44)}" cy="${f1(by + 24)}" r="4" fill="rgba(255,255,255,0.9)"/>`;
@@ -1258,29 +1414,90 @@ function renderGlyph(card) { // shared 200×200 group, byte-identical in cards a
       g += `<path d="M${f1(lx)},${f1(by - 10)} v34 l-9 30 q-3 10 7 10 h22 q10 0 7 -10 l-9 -30 v-34 Z" ${FS}/><rect x="${f1(lx - 2)}" y="${f1(by + 30)}" width="34" height="22" rx="4" fill="${col}" fill-opacity="0.45"/>`;
     }
   }
-  return `<g class="glyph"><title>${esc(card.motif)}</title>${g}</g>`;
+  return `<g class="glyph k-${String(card.kind || 'Experiment').toLowerCase()}"><title>${esc(card.motif)}</title>${g}</g>`;
 }
-function renderSprite(card, px) { return `<svg class="sprite-svg" viewBox="0 0 200 200" width="${px}" height="${px}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${esc(card.name)}">${renderGlyph(card)}</svg>`; }
-const kwBadge = (kw) => (kw ? `<tspan class="kw">${SET.effects[kw].badge}</tspan>` : '');
-function renderCard(card, o) {
-  o = o || {}; const col = sysColor(card.sys), owned = o.owned !== false, frame = RARITY_FRAME[card.rarity], fw = card.rarity === 'L' ? 8 : 6;
+// Sprites (Addendum 2 §6): a printing's sprite is its creature's glyph plus a glow ring — white for an Illustration Rare, gold for a Secret, iridescent for the Mythic
+const SPRITE_RING = (() => {
+  const two = (c1, c2) => `<circle cx="100" cy="100" r="93" fill="none" stroke="${c1}" stroke-opacity="0.22" stroke-width="12"/><circle cx="100" cy="100" r="93" fill="none" stroke="${c2}" stroke-opacity="0.95" stroke-width="2.6"/>`;
+  return { IR: `<g class="sprite-ring ring-IR">${two('#ffffff', '#ffffff')}</g>`, SIR: `<g class="sprite-ring ring-SIR">${two('#fbbf24', '#fde68a')}</g>`,
+    M: `<g class="sprite-ring ring-M"><circle cx="100" cy="100" r="93" fill="none" stroke="#c084fc" stroke-opacity="0.25" stroke-width="12"/>${IRIS.slice(0, 5).map((c, i) => `<path d="${arcPath(100, 100, 93, i * 1.2566 - 1.5708, (i + 1.04) * 1.2566 - 1.5708)}" fill="none" stroke="${c}" stroke-width="3"/>`).join('')}</g>` };
+})();
+function renderSprite(card, px) { const p = PBYID[card.id] || card, base = BYID[p.baseId] || p; return `<svg class="sprite-svg" viewBox="0 0 200 200" width="${px}" height="${px}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${esc(base.name)}">${SPRITE_RING[p.rarity] || ''}${renderGlyph(base)}</svg>`; }
+const SET_SIZE = CARDS.length, num3 = (n) => String(n).padStart(3, '0') + '/' + SET_SIZE; // printed NNN/151
+const fitPx = (text, px, width, em) => f1(Math.max(6.5, Math.min(px, width / (Math.max(1, String(text).length) * (em || 0.6))))); // shrink a one-line label to its box (≈ em per character)
+const fsAttr = (fs, px) => (fs < px ? ` style="font-size:${fs}px"` : '');
+function wrap2(text, max) { if (text.length <= max) return [text]; let best = -1; for (let i = 0; i < text.length; i++) if (text[i] === ' ' && (best < 0 || Math.abs(i - text.length / 2) < Math.abs(best - text.length / 2))) best = i; return best < 0 ? [text] : [text.slice(0, best), text.slice(best + 1)]; }
+function chipSvg(sys, x, y, w) { // a System chip; Qualia's 'all' is a dark chip with the five-colour ring
+  w = w || 40; const h = w >= 40 ? 13 : 10, sm = w < 40 ? ' style="font-size:6.5px"' : '';
+  if (sys === 'all') return `<rect x="${x}" y="${y - h + 4}" width="${w}" height="${h}" rx="${h / 2}" fill="#1e1b4b" stroke="rgba(255,255,255,0.55)" stroke-width="0.8"/>${SYS.map((s, i) => `<path d="${arcPath(x + h / 2 + 1, y - h / 2 + 4, h / 2 - 2.6, i * 1.2566 - 1.5708, (i + 1.04) * 1.2566 - 1.5708)}" fill="none" stroke="${sysColor(s)}" stroke-width="${h >= 13 ? 2.2 : 1.8}"/>`).join('')}<text x="${f1(x + w / 2 + h / 3)}" y="${y + (h >= 13 ? 1 : 0.5)}" text-anchor="middle" class="t-chip" fill="#f5f3ff"${sm}>ALL</text>`;
+  return `<rect x="${x}" y="${y - h + 4}" width="${w}" height="${h}" rx="${h / 2}" fill="${sysColor(sys)}" fill-opacity="0.9"/><text x="${x + w / 2}" y="${y + (h >= 13 ? 1 : 0.5)}" text-anchor="middle" class="t-chip" fill="#0b0f1a"${sm}>${SYSTEMS[sys].name.slice(0, 3).toUpperCase()}</text>`;
+}
+function moveSvg(m, y, small) { // one move row: name (shrunk to fit), System chip, power, keyword badge; `small` is the 9 px full-art band
+  const x0 = small ? 16 : 22, cx = small ? 214 : 196, px = small ? 262 : 258, kx = small ? 266 : 262, kw = small ? 22 : 26, fs = fitPx(m.name, small ? 9 : 11, cx - x0 - 6, 0.56), cls = small ? 't-move9' : 't-move';
+  return `<text x="${x0}" y="${y}" class="${cls}" fill="#f1f5f9"${fsAttr(fs, small ? 9 : 11)}>${esc(m.name)}</text>${chipSvg(m.sys, cx, y, small ? 30 : 40)}<text x="${px}" y="${y}" text-anchor="end" class="${cls}" fill="#f1f5f9">${m.power}</text>${m.kw ? `<rect x="${kx}" y="${y - (small ? 7.5 : 9)}" width="${kw}" height="${small ? 10 : 12}" rx="3" fill="rgba(255,255,255,0.18)"/><text x="${kx + kw / 2}" y="${y}" text-anchor="middle" class="t-kw" fill="#f8fafc"${small ? ' style="font-size:7px"' : ''}>${SET.effects[m.kw].badge}</text>` : ''}`;
+}
+const flavorSvg = (text, y) => { const L2 = wrap2(text, 58); return L2.length === 1 ? `<text x="22" y="${y}" class="t-flavor" fill="#94a3b8"${fsAttr(fitPx(text, 9, 262, 0.47), 9)}>${esc(text)}</text>` : L2.map((t, i) => `<text x="22" y="${y - 4 + i * 11}" class="t-flavor" fill="#94a3b8" style="font-size:${Math.min(8.5, fitPx(L2[0].length > L2[1].length ? L2[0] : L2[1], 8.5, 262, 0.47))}px">${esc(t)}</text>`).join(''); };
+const SHEEN = (uid, colors) => `<g class="sheen" clip-path="url(#clip${uid})" opacity="0.35" style="mix-blend-mode:screen"><g class="sheen-move" mask="url(#sm${uid})">${conic(150, 210, 640, colors, 36)}</g></g>`; // its centre follows --mx/--my (the pointer) like the Holo shimmer
+const sheenDefs = (uid) => `<radialGradient id="smg${uid}"><stop offset="0" stop-color="#ffffff" stop-opacity="0"/><stop offset="0.3" stop-color="#ffffff" stop-opacity="0.85"/><stop offset="0.6" stop-color="#ffffff" stop-opacity="0.5"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/></radialGradient><mask id="sm${uid}" maskUnits="userSpaceOnUse" x="-700" y="-700" width="1700" height="1820"><circle cx="150" cy="210" r="330" fill="url(#smg${uid})"/></mask>`;
+const foilDef = (uid, seed) => `<filter id="foil${uid}"><feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" seed="${seed % 97}"/><feColorMatrix values="0 0 0 0 1  0 0 0 0 0.85  0 0 0 0 0.4  0 0 0 0.9 0"/><feComposite in2="SourceGraphic" operator="in"/></filter>`;
+const svgOpen = (card, cls, label) => `<svg class="card-svg ${cls}" viewBox="0 0 300 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${esc(label)}">`;
+function renderCard(card, o) { // full: pack reveals, Summary, detail modal · mini: Binder, Team, trainer and rival cards (art, frame and name; the small print is left out)
+  o = o || {}; const base = BYID[card.baseId] || card, mini = o.size === 'mini';
   // def ids are deterministic without o.uid; the UI passes a per-render uid so the same card on two screens never shares a gradient reference
-  const uid = 'c' + card.seed.toString(36) + (o.uid ? '_' + o.uid : ''), r = mulberry32(card.seed ^ 0x5bd1e995); let defs = `<linearGradient id="bg${uid}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${col}"/><stop offset="1" stop-color="${darken(col, 0.35)}"/></linearGradient>`;
-  let extra = '';
-  if (card.rarity === 'L') { defs += `<filter id="foil${uid}"><feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" seed="${card.seed % 97}"/><feColorMatrix values="0 0 0 0 1  0 0 0 0 0.85  0 0 0 0 0.4  0 0 0 0.9 0"/><feComposite in2="SourceGraphic" operator="in"/></filter>`; for (let i = 0; i < 24; i++) extra += `<circle cx="${f1(10 + r() * 280)}" cy="${f1(10 + r() * 400)}" r="${f1(1 + r() * 2.5)}" fill="rgba(255,255,255,${f1(0.08 + r() * 0.25)})"/>`; }
-  if (!owned) return `<svg class="card-svg unowned" viewBox="0 0 300 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${esc(card.name)} (not owned)"><rect x="0" y="0" width="300" height="420" rx="16" fill="#1a2030"/><rect x="3" y="3" width="294" height="414" rx="14" fill="none" stroke="#2a3344" stroke-width="4"/><g transform="translate(50,60)" opacity="0.2">${renderGlyph(card)}</g><text x="150" y="330" text-anchor="middle" class="t-name" fill="#64748b">${esc(card.name)}</text><text x="150" y="352" text-anchor="middle" class="t-small" fill="#475569">?</text></svg>`;
-  const chip = (sys, x, y) => `<rect x="${x}" y="${y - 9}" width="40" height="13" rx="6" fill="${sysColor(sys)}" fill-opacity="0.9"/><text x="${x + 20}" y="${y + 1}" text-anchor="middle" class="t-chip" fill="#0b0f1a">${SYSTEMS[sys].name.slice(0, 3).toUpperCase()}</text>`;
-  const moveRow = (m, y) => `<text x="22" y="${y}" class="t-move" fill="#f1f5f9">${esc(m.name)}</text>${chip(m.sys, 196, y)}<text x="258" y="${y}" text-anchor="end" class="t-move" fill="#f1f5f9">${m.power}</text>${m.kw ? `<rect x="262" y="${y - 9}" width="26" height="12" rx="3" fill="rgba(255,255,255,0.18)"/><text x="275" y="${y}" text-anchor="middle" class="t-kw" fill="#f8fafc">${SET.effects[m.kw].badge}</text>` : ''}`;
-  const gem = card.rarity === 'H' ? `<defs><linearGradient id="gem${uid}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f87171"/><stop offset="0.5" stop-color="#4ade80"/><stop offset="1" stop-color="#60a5fa"/></linearGradient></defs><polygon points="276,306 284,314 276,322 268,314" fill="url(#gem${uid})"/>` : `<polygon points="276,306 284,314 276,322 268,314" fill="${frame}"/>`;
-  const ltp = o.copies >= 2 ? `<rect x="214" y="12" width="74" height="18" rx="9" fill="#0f172a" fill-opacity="0.85"/><text x="251" y="25" text-anchor="middle" class="t-small" fill="#5eead4">LTP +${Math.round((potentiation(o.copies) - 1) * 100)}%</text>` : '';
-  const frameRect = card.rarity === 'H' ? `<rect x="3" y="3" width="294" height="414" rx="14" fill="none" stroke="rgba(255,255,255,0.55)" stroke-width="${fw}"/>` : `<rect x="${fw / 2}" y="${fw / 2}" width="${300 - fw}" height="${420 - fw}" rx="14" fill="none" stroke="${frame}" stroke-width="${fw}" ${card.rarity === 'L' ? `filter="url(#foil${uid})"` : ''}/>${card.rarity === 'U' ? '<rect x="10" y="10" width="280" height="400" rx="11" fill="none" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>' : ''}`;
-  const plate = card.rarity === 'L' ? '<rect x="8" y="296" width="284" height="116" rx="8" fill="rgba(5,8,16,0.55)"/>' : '<rect x="8" y="296" width="284" height="116" rx="8" fill="rgba(5,8,16,0.72)"/>';
-  return `<svg class="card-svg r-${card.rarity}" viewBox="0 0 300 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${esc(card.name)}"><defs>${defs}</defs>` +
-    `<rect x="0" y="0" width="300" height="420" rx="16" fill="url(#bg${uid})"/>${extra}` +
-    `<g transform="translate(50,48)">${renderGlyph(card)}</g><text x="150" y="285" text-anchor="middle" class="t-motif" fill="rgba(255,255,255,0.75)">${esc(card.motif)}</text>` +
-    plate + `<text x="22" y="320" class="t-name" fill="#f8fafc">${esc(card.name)}</text><text x="22" y="334" class="t-small" fill="#cbd5e1">${card.kind} · ${card.body}</text>${chip(card.sys, 196, 318)}${gem}` +
-    `<text x="22" y="352" class="t-stat" fill="#e2e8f0">HP ${card.hp}  ·  ATK ${card.atk}  ·  DEF ${card.def}  ·  SPD ${card.spd}</text>` +
-    moveRow(card.moves[0], 372) + moveRow(card.moves[1], 392) + `<text x="22" y="408" class="t-flavor" fill="#94a3b8">${esc(card.flavor)}</text>${ltp}${frameRect}</svg>`;
+  const uid = 'c' + card.seed.toString(36) + (o.uid ? '_' + o.uid : '');
+  if (o.owned === false) return renderUnowned(card, base, mini);
+  return isVariantP(card) ? renderIllus(card, base, o, uid, mini) : renderBaseCard(card, o, uid, mini);
+}
+function renderUnowned(card, base, mini) { // the grey silhouette: a creature shows its glyph at 20% and its name; a chase printing (or #151) only its number — the art is the surprise
+  const secret = card.rarity === 'M' || isVariantP(card), label = secret ? num3(card.number) : card.name, L2 = mini ? wrap2(label, 15) : [label], fs = fitPx(L2.reduce((a, b) => (b.length > a.length ? b : a)), mini ? (L2.length > 1 ? 26 : 30) : 16, 250, 0.6);
+  return svgOpen(card, 'unowned', (secret ? 'No. ' + num3(card.number) : card.name) + ' (not owned)') + '<rect x="0" y="0" width="300" height="420" rx="16" fill="#1a2030"/><rect x="3" y="3" width="294" height="414" rx="14" fill="none" stroke="#2a3344" stroke-width="4"/>' +
+    (secret ? `<rect x="22" y="22" width="256" height="376" rx="10" fill="none" stroke="#2a3344" stroke-width="2" stroke-dasharray="6 6"/><polygon points="${starPts(150, 170, 52, 21)}" fill="none" stroke="#3b4761" stroke-width="4" stroke-linejoin="round"/>` : `<g transform="translate(50,60)" opacity="0.2">${renderGlyph(base)}</g>`) +
+    L2.map((t, i) => `<text x="150" y="${mini ? (L2.length > 1 ? 330 + i * fs * 1.08 : 344) : 330}" text-anchor="middle" class="t-name" fill="#64748b"${mini || fs < 16 ? ` style="font-size:${fs}px"` : ''}>${esc(t)}</text>`).join('') + (mini ? '' : '<text x="150" y="352" text-anchor="middle" class="t-small" fill="#475569">?</text>') + '</svg>';
+}
+function renderBaseCard(card, o, uid, mini) { // C/U/R/H/L frames (§5.3) and the Mythic: the Legendary layout with an iridescent conic frame and sheen, its glyph at 15% over a 40-particle shimmer
+  const fr = card.rarity, M = fr === 'M', col = sysColor(card.sys), fw = fr === 'L' || M ? 8 : 6, r = mulberry32(card.seed ^ 0x5bd1e995), heavy = fr === 'L' || M;
+  let defs = M ? `<linearGradient id="bg${uid}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3b0764"/><stop offset="0.55" stop-color="#1e1b4b"/><stop offset="1" stop-color="#0b1020"/></linearGradient><radialGradient id="bp${uid}" cx="0.18" cy="0.12" r="0.65"><stop offset="0" stop-color="#f472b6" stop-opacity="0.4"/><stop offset="1" stop-color="#f472b6" stop-opacity="0"/></radialGradient><radialGradient id="bc${uid}" cx="0.85" cy="0.62" r="0.6"><stop offset="0" stop-color="#22d3ee" stop-opacity="0.32"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/></radialGradient><linearGradient id="ig${uid}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f472b6"/><stop offset="0.5" stop-color="#c084fc"/><stop offset="1" stop-color="#22d3ee"/></linearGradient><clipPath id="clip${uid}"><rect width="300" height="420" rx="16"/></clipPath><clipPath id="ring${uid}"><path clip-rule="evenodd" d="${rrPath(0, 0, 300, 420, 16)}${rrPath(fw, fw, 300 - 2 * fw, 420 - 2 * fw, 10)}"/></clipPath>`
+    : `<linearGradient id="bg${uid}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${col}"/><stop offset="1" stop-color="${darken(col, 0.35)}"/></linearGradient>`;
+  let art = '';
+  if (fr === 'L') { if (!mini) defs += foilDef(uid, card.seed); for (let i = 0; i < 24; i++) art += `<circle cx="${f1(10 + r() * 280)}" cy="${f1(10 + r() * 400)}" r="${f1(1 + r() * 2.5)}" fill="rgba(255,255,255,${f1(0.08 + r() * 0.25)})"/>`; } // full-art bleed with 24 faint dots
+  if (M) { art += `<rect width="300" height="420" fill="url(#bp${uid})"/><rect width="300" height="420" fill="url(#bc${uid})"/><g class="shimmer">`; for (let i = 0; i < 40; i++) art += `<circle cx="${f1(14 + r() * 272)}" cy="${f1(14 + r() * 272)}" r="${f1(0.8 + r() * 2.6)}" fill="${IRIS[Math.floor(r() * 5)]}" fill-opacity="${f1(0.3 + r() * 0.6)}"/>`; art += '</g>'; if (!mini) defs += sheenDefs(uid); }
+  if (fr === 'H') defs += `<linearGradient id="gem${uid}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f87171"/><stop offset="0.5" stop-color="#4ade80"/><stop offset="1" stop-color="#60a5fa"/></linearGradient>`;
+  const glyph = mini ? `<g transform="translate(35,${M ? 30 : 34}) scale(1.15)"${M ? ' opacity="0.15"' : ''}>${renderGlyph(card)}</g>` : `<g transform="translate(50,40)"${M ? ' opacity="0.15"' : ''}>${renderGlyph(card)}</g>`;
+  const frame = fr === 'H' ? '<rect class="frame" x="3" y="3" width="294" height="414" rx="14" fill="none" stroke="rgba(255,255,255,0.55)" stroke-width="6"/>'
+    : M ? `<g class="frame iris" clip-path="url(#ring${uid})">${conic(150, 210, 270, IRIS, 36)}</g><rect x="${fw + 0.5}" y="${fw + 0.5}" width="${299 - 2 * fw}" height="${419 - 2 * fw}" rx="10" fill="none" stroke="rgba(255,255,255,0.45)" stroke-width="1"/>`
+      : `<rect class="frame" x="${fw / 2}" y="${fw / 2}" width="${300 - fw}" height="${420 - fw}" rx="14" fill="none" stroke="${RARITY_FRAME[fr]}" stroke-width="${fw}"${fr === 'L' && !mini ? ` filter="url(#foil${uid})"` : ''}/>${fr === 'U' ? '<rect x="10" y="10" width="280" height="400" rx="11" fill="none" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>' : ''}`;
+  const top = `${svgOpen(card, 'r-' + fr + (mini ? ' mini' : ''), card.name)}<defs>${defs}</defs><rect x="0" y="0" width="300" height="420" rx="16" fill="url(#bg${uid})"/>${art}${glyph}`;
+  const eyebrow = M ? `<text x="150" y="30" text-anchor="middle" class="t-eyebrow" fill="#f5d0fe" style="letter-spacing:0.5em">SECRET</text>` : '';
+  if (mini) { const L2 = wrap2(card.name, 15), fs = fitPx(L2.reduce((a, b) => (b.length > a.length ? b : a)), L2.length > 1 ? 26 : 30, 262, 0.6);
+    return top + `<rect x="8" y="318" width="284" height="94" rx="8" fill="rgba(5,8,16,${heavy ? 0.55 : 0.72})"/>` + L2.map((t, i) => `<text x="150" y="${L2.length > 1 ? 357 + i * fs * 1.08 : 374}" text-anchor="middle" class="t-name" fill="#f8fafc" style="font-size:${fs}px">${esc(t)}</text>`).join('') + eyebrow + (M ? `<polygon points="${starPts(276, 300, 11, 4.6)}" fill="url(#ig${uid})"/>` : '') + frame + '</svg>'; }
+  const gem = M ? `<polygon points="${starPts(276, 305, 9, 3.8)}" fill="url(#ig${uid})"/>` : `<polygon points="276,297 284,305 276,313 268,305" fill="${fr === 'H' ? `url(#gem${uid})` : RARITY_FRAME[fr]}"/>`;
+  const pot = o.ltp != null ? o.ltp : o.copies >= 2 ? potentiation(o.copies) : 1; // the creature's LTP across all its printings when the caller knows it
+  const ltp = pot > 1 ? `<rect x="214" y="12" width="74" height="18" rx="9" fill="#0f172a" fill-opacity="0.85"/><text x="251" y="25" text-anchor="middle" class="t-small" fill="#5eead4">LTP +${Math.round((pot - 1) * 100)}%</text>` : '';
+  return top + `<text x="150" y="281" text-anchor="middle" class="t-motif" fill="rgba(255,255,255,0.75)">${esc(card.motif)}</text>${eyebrow}` +
+    `<rect x="8" y="290" width="284" height="122" rx="8" fill="rgba(5,8,16,${heavy ? 0.55 : 0.72})"/><text x="22" y="311" class="t-name" fill="#f8fafc"${fsAttr(fitPx(card.name, 16, 168, 0.6), 16)}>${esc(card.name)}</text>${chipSvg(card.sys, 196, 309)}${gem}` +
+    `<text x="22" y="325" class="t-small" fill="#cbd5e1">${card.kind} · ${card.body}</text><text x="284" y="325" text-anchor="end" class="t-num" fill="${M ? '#f5d0fe' : '#94a3b8'}">${num3(card.number)}</text>` +
+    `<text x="22" y="341" class="t-stat" fill="#e2e8f0">HP ${card.hp}  ·  ATK ${card.atk}  ·  DEF ${card.def}  ·  SPD ${card.spd}</text>` +
+    moveSvg(card.moves[0], 359) + moveSvg(card.moves[1], 376) + flavorSvg(card.flavor, 396) + ltp + (M && !mini ? SHEEN(uid, IRIS) : '') + frame + '</svg>';
+}
+function renderIllus(card, base, o, uid, mini) { // Illustration Rare / Secret (Addendum 2 §6): no rarity frame (a Secret: 8 px of gold), a seeded full-bleed scene, the creature's glyph ×1.45, a translucent text band
+  const sir = card.rarity === 'SIR', col = sysColor(base.sys), r = mulberry32(card.seed ^ 0x2c1b3c6d), rnd = (a, b) => a + r() * (b - a), ink = sir ? '#fde68a' : '#ffffff';
+  const hz = 420 * rnd(0.55, 0.65), gx = 150 + rnd(-18, 18), gy = 166 + rnd(-18, 18);
+  let defs = `<clipPath id="clip${uid}"><rect width="300" height="420" rx="16"/></clipPath><linearGradient id="bg${uid}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${col}"/><stop offset="1" stop-color="#0b1020"/></linearGradient><linearGradient id="hz${uid}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${tint(col, 0.65)}" stop-opacity="0"/><stop offset="0.5" stop-color="${tint(col, 0.65)}" stop-opacity="0.6"/><stop offset="1" stop-color="${tint(col, 0.65)}" stop-opacity="0"/></linearGradient><radialGradient id="gl${uid}"><stop offset="0" stop-color="#ffffff" stop-opacity="0.5"/><stop offset="0.45" stop-color="${tint(col, 0.45)}" stop-opacity="0.22"/><stop offset="1" stop-color="${col}" stop-opacity="0"/></radialGradient>`;
+  if (sir) defs += `<linearGradient id="gold${uid}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="0.5" stop-color="#fde68a"/><stop offset="1" stop-color="#fbbf24"/></linearGradient>` + (mini ? '' : foilDef(uid, card.seed) + sheenDefs(uid));
+  let scene = `<rect width="300" height="420" fill="url(#bg${uid})"/><rect x="0" y="${f1(hz - 28)}" width="300" height="56" fill="url(#hz${uid})"/>`;
+  for (let i = 0; i < 18; i++) { const x = rnd(10, 290), y = rnd(12, hz - 24), s = rnd(1.6, 4.6), w = s * 0.28; scene += `<path d="M${f1(x)},${f1(y - s)}L${f1(x + w)},${f1(y - w)}L${f1(x + s)},${f1(y)}L${f1(x + w)},${f1(y + w)}L${f1(x)},${f1(y + s)}L${f1(x - w)},${f1(y + w)}L${f1(x - s)},${f1(y)}L${f1(x - w)},${f1(y - w)}Z" fill="#ffffff" fill-opacity="${f1(rnd(0.35, 0.95))}"/>`; } // 18 sparkles in the sky
+  [0.35, 0.25, 0.15].forEach((op, k) => { const y0 = hz + 4 + k * 24, P = []; for (let i = 0; i <= 6; i++) P.push([-20 + (i * 340) / 6, y0 + rnd(-14, 14) - (i % 2 ? rnd(4, 20) : 0)]); scene += `<path d="${crPath(P, false)}L320,430L-20,430Z" fill="${tint(col, 0.3 + 0.18 * k)}" fill-opacity="${op}"/>`; }); // three stacked hills, far to near
+  scene += `<circle cx="${f1(gx)}" cy="${f1(gy)}" r="132" fill="url(#gl${uid})"/><g transform="translate(${f1(gx - 145)},${f1(gy - 145)}) scale(1.45)">${renderGlyph(base)}</g>`;
+  const eyebrow = sir ? 'SECRET ILLUSTRATION RARE' : 'ILLUSTRATION RARE', star = (cx, cy, R) => `<polygon points="${starPts(cx, cy, R, R * 0.42)}" fill="${sir ? `url(#gold${uid})` : '#ffffff'}"${sir ? ' stroke="#92400e" stroke-width="0.8"' : ''}/>`;
+  const frame = sir ? `<rect class="frame gold" x="4" y="4" width="292" height="412" rx="13" fill="none" stroke="url(#gold${uid})" stroke-width="8"/>${mini ? '' : `<rect x="4" y="4" width="292" height="412" rx="13" fill="none" stroke="#ffffff" stroke-width="8" filter="url(#foil${uid})" opacity="0.6"/>`}` : '';
+  const head = `${svgOpen(card, 'r-' + card.rarity + (mini ? ' mini' : ''), `${base.name}, ${RARITY[card.rarity].name}`)}<title>${esc(card.scene || base.motif)}</title><defs>${defs}</defs><g class="scene" clip-path="url(#clip${uid})">${scene}`;
+  if (mini) { const L2 = wrap2(base.name, 15), fs = fitPx(L2.reduce((a, b) => (b.length > a.length ? b : a)), L2.length > 1 ? 26 : 30, 262, 0.6);
+    return head + `<rect x="0" y="330" width="300" height="90" fill="rgba(0,0,0,0.45)"/></g>` + L2.map((t, i) => `<text x="150" y="${L2.length > 1 ? 366 + i * fs * 1.08 : 384}" text-anchor="middle" class="t-name" fill="${ink}" style="font-size:${fs}px">${esc(t)}</text>`).join('') + star(150, 44, 22) + frame + '</svg>'; }
+  return head + `<rect x="0" y="324" width="300" height="96" fill="rgba(0,0,0,0.45)"/></g>${sir ? `<rect x="8" y="324" width="284" height="88" fill="#ffffff" filter="url(#foil${uid})" opacity="0.16"/>` : ''}` +
+    `<text x="16" y="339" class="t-eyebrow" fill="${sir ? '#fde68a' : 'rgba(255,255,255,0.85)'}">${eyebrow}</text>${star(281, 335, 7.5)}` +
+    `<text x="16" y="357" class="t-name" fill="#ffffff"${fsAttr(fitPx(base.name, 15, 176, 0.6), 15)}>${esc(base.name)}</text>${chipSvg(base.sys, 198, 355)}<text x="${sir ? 286 : 288}" y="357" text-anchor="end" class="t-num" fill="${ink}">${num3(card.number)}</text>` +
+    moveSvg(base.moves[0], 371, true) + moveSvg(base.moves[1], 383, true) + `<text x="16" y="396" class="t-stat9" fill="#e2e8f0">HP ${base.hp} · ATK ${base.atk} · DEF ${base.def} · SPD ${base.spd}</text>` +
+    `<text x="16" y="409" class="t-cap" fill="rgba(255,255,255,0.72)"${fsAttr(fitPx(card.scene || '', 9, 268, 0.46), 9)}>${esc(card.scene || '')}</text>${sir ? SHEEN(uid, RAINBOW) : ''}${frame}</svg>`;
 }
 function renderPortrait(rival, uidSuffix) {
   const grey = rival.specialty == null, col = grey ? '#94a3b8' : sysColor(rival.specialty), uid = 'p' + rival.rung + (uidSuffix ? '_' + uidSuffix : '');
@@ -1306,16 +1523,16 @@ const sysChip = (s, small) => `<span class="chip sys-${s}${small ? ' sm' : ''}">
 const rarityName = (r) => RARITY[r].name;
 let svgSeq = 0; // every rendered card/portrait gets its own SVG def ids, so the same card on two screens never shares a gradient/clip reference
 function cardHtml(card, o) {
-  o = o || {}; const copies = o.copies != null ? o.copies : (save.collection[card.id] || 0), owned = o.owned !== false;
+  o = o || {}; const copies = o.copies != null ? o.copies : (save.collection[card.id] || 0), owned = o.owned !== false, ltp = o.ltp != null ? o.ltp : owned ? ltpOf(card.id).pot : 1; // LTP is the creature's
   let extra = ''; if (owned && card.rarity === 'R' && o.size !== 'mini') { const r = mulberry32(card.seed ^ 0x1234); for (let i = 0; i < 12; i++) extra += `<i class="particle" style="left:${(5 + r() * 90).toFixed(1)}%;top:${(5 + r() * 90).toFixed(1)}%;animation-delay:${(-r() * 6).toFixed(2)}s"></i>`; }
-  return `<div class="card r-${card.rarity}${o.size === 'mini' ? ' mini' : ''}${owned ? '' : ' unowned'}" data-id="${card.id}" style="--mx:50%;--my:50%">${renderCard(card, { owned, copies, uid: ++svgSeq })}${extra}</div>`;
+  return `<div class="card r-${card.rarity}${o.size === 'mini' ? ' mini' : ''}${owned ? '' : ' unowned'}" data-id="${card.id}" style="--mx:50%;--my:50%">${renderCard(card, { owned, copies, ltp, uid: ++svgSeq, size: o.size })}${extra}</div>`;
 }
 const miniCard = (card, o) => cardHtml(card, Object.assign({ size: 'mini' }, o));
 function ring(pct, size, label) { const r = (size - 6) / 2, c = 2 * Math.PI * r; return `<svg class="ring" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}"><circle cx="${size / 2}" cy="${size / 2}" r="${r}" class="ring-bg"/><circle cx="${size / 2}" cy="${size / 2}" r="${r}" class="ring-fg" stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${(c * (1 - clamp(pct, 0, 1))).toFixed(1)}"/>${label != null ? `<text x="50%" y="54%" text-anchor="middle" class="ring-text">${label}</text>` : ''}</svg>`; }
 function setHTML(sel, html) { const el = typeof sel === 'string' ? $(sel) : sel; if (el) el.innerHTML = html; return el; }
 function toast(msg, kind, ms) { const t = document.createElement('div'); t.className = 'toast ' + (kind || ''); t.textContent = msg; els.toasts.appendChild(t); clock.setTimeout(() => t.remove(), ms || CONST.anim.toast, true); } // stays up for its virtual duration even under skipAnims; its timer survives a reset's clearAll
 function dialog(o) { // in-page dialogs only (native alert/confirm are unavailable in the artifact host)
-  const d = document.createElement('div'); d.className = 'modal-wrap'; d.innerHTML = `<div class="modal" role="dialog" aria-modal="true" aria-label="${esc(o.title || o.label || 'Dialog')}">${o.title ? `<h3>${esc(o.title)}</h3>` : ''}${o.html || ''}<div class="modal-btns">${(o.buttons || [{ label: 'Close' }]).map((b, i) => `<button class="${b.primary ? 'primary' : b.danger ? 'danger' : 'ghost'}" data-dlg="${i}">${esc(b.label)}</button>`).join('')}</div></div>`;
+  const d = document.createElement('div'); d.className = 'modal-wrap' + (o.cls ? ' ' + o.cls : ''); d.innerHTML = `<div class="modal" role="dialog" aria-modal="true" aria-label="${esc(o.title || o.label || 'Dialog')}">${o.title ? `<h3>${esc(o.title)}</h3>` : ''}${o.html || ''}<div class="modal-btns">${(o.buttons || [{ label: 'Close' }]).map((b, i) => `<button class="${b.primary ? 'primary' : b.danger ? 'danger' : 'ghost'}" data-dlg="${i}">${esc(b.label)}</button>`).join('')}</div></div>`;
   d.addEventListener('click', (e) => { const b = e.target.closest('[data-dlg]'); if (b) { const btn = (o.buttons || [{}])[+b.dataset.dlg]; d.remove(); if (btn && btn.onClick) btn.onClick(d); } else if (e.target === d && !o.sticky) d.remove(); });
   els.modals.appendChild(d); return d;
 }
@@ -1325,6 +1542,7 @@ function show(name) {
   els.flask.classList.toggle('hidden', name === 'battle' || !!ads.current);
   if (name === 'home' || name === 'shop' || name === 'binder') bannerStart(); else bannerStop();
   els.app.dataset.screen = name;
+  if (name === 'binder') binderLazy(); else if (binderIO || binderScroll) binderStop(); // thumbnails render only while the Binder is on screen
 }
 function goHome() { // every Home transition runs the interstitial check (A-6.8.6)
   offers.dismissPending();
@@ -1350,7 +1568,7 @@ function renderHome() {
   const s = save, m = model, rv = RIVALS[s.ladder.nextRung - 1], seen = s.ladder.seenTeams[rv.rung], nxt = focusNextMs(), del = deliveryState();
   const pips = Array.from({ length: CONST.focus.max }, (_, i) => `<i class="pip${i < s.focus ? ' on' : ''}"></i>`).join('');
   const teamPip = s.teamPip ? '<span class="pip-tag">NEW · stronger</span>' : '';
-  const team = seen ? `<div class="rival-team">${seen.map((id) => miniCard(BYID[id], { copies: 1 })).join('')}</div>` : `<div class="rival-team">${[0, 1, 2].map(() => '<div class="card mini unknown"><span>?</span></div>').join('')}</div>`;
+  const team = seen ? `<div class="rival-team">${seen.map((id) => (id !== MYTHIC_ID || knows151() ? miniCard(BYID[id], { copies: 1, ltp: 1 }) : '<div class="card mini unknown"><span>???</span></div>')).join('')}</div>` : `<div class="rival-team">${[0, 1, 2].map(() => '<div class="card mini unknown"><span>?</span></div>').join('')}</div>`;
   const tiles = [];
   tiles.push(`<button class="tile${s.coins >= CONST.coins.packCost ? ' glow' : ''}" data-act="open-standard"><b>Standard Pack</b><span>5 cards · ${CONST.coins.packCost} coins</span></button>`);
   tiles.push(del.ready ? `<button class="tile ready" data-act="claim-delivery"><b>Lab Delivery</b><span>Claim · <span data-tick="claim">${fmtMS(del.claimLeft)}</span></span></button>`
@@ -1367,7 +1585,7 @@ function renderHome() {
       <div class="streak" title="Daily streak"><i class="flame"></i>${s.streak.days}d</div><button class="icon" data-act="go:settings" aria-label="Settings">⚙</button></div>
     <div class="rival"><div class="rival-head">${renderPortrait(rv, ++svgSeq)}<div><div class="rival-name">${esc(rv.name)}</div><div class="rival-sub">Rung ${rv.rung} · ${rv.league} League${s.ladder.cleared[rv.rung] ? ' · Rematch · 60% coins' : ''}</div>${rv.specialty ? `<span class="chip sys-${rv.specialty}">${SYSTEMS[rv.specialty].name} specialist</span>` : '<span class="chip">Any System</span>'}<div class="quip">“${esc(rv.quip)}”</div></div></div>${team}</div>
     <button class="battle-btn${s.focus <= 0 ? ' empty' : ''}" data-act="battle">▶ BATTLE <small>${s.focus <= 0 ? '(no Focus · next in <span data-tick="focus2">' + (nxt != null ? fmtMS(nxt) : '--:--') + '</span>)' : '(1 Focus)'}</small></button>
-    <div class="row4"><button data-act="go:team"><span class="ic">${ICON.team}</span>TEAM${teamPip}</button><button data-act="go:ladder"><span class="ic">${ICON.ladder}</span>LADDER</button><button data-act="go:binder"><span class="ic">${ICON.binder}</span>BINDER ${ring(binder.ownedCount() / CARDS.length, 26, binder.ownedCount())}</button><button data-act="go:shop"><span class="ic">${ICON.shop}</span>SHOP</button></div>
+    <div class="row4"><button data-act="go:team"><span class="ic">${ICON.team}</span>TEAM${teamPip}</button><button data-act="go:ladder"><span class="ic">${ICON.ladder}</span>LADDER</button><button data-act="go:binder"><span class="ic">${ICON.binder}</span>BINDER ${ring(binder.ownedCount() / PRINTINGS.length, 26, binder.ownedCount())}</button><button data-act="go:shop"><span class="ic">${ICON.shop}</span>SHOP</button></div>
     <div class="tiles">${tiles.join('')}</div>
     <div class="fomo">Action Potential rotates in <span data-tick="rotation">${fmtClock(rotationLeftMs())}</span></div>
     ${bannerHtml()}`);
@@ -1377,8 +1595,8 @@ function renderLadder() {
   for (const rv of RIVALS) {
     if (rv.league !== league) { league = rv.league; html += `<div class="league">${league} League${rv.wall ? ' · wall' : ''}</div>`; }
     const cleared = !!s.ladder.cleared[rv.rung], unlocked = rv.rung <= Math.min(12, s.ladder.best + 1), next = rv.rung === s.ladder.nextRung, seen = s.ladder.seenTeams[rv.rung];
-    const names = seen ? seen.map((id) => BYID[id].name).join(', ') : '';
-    html += `<button class="rung${cleared ? ' cleared' : ''}${unlocked ? '' : ' locked'}${next ? ' next' : ''}" data-act="rung:${rv.rung}" ${unlocked ? '' : 'disabled'}>${renderPortrait(rv, ++svgSeq)}<div><div class="rival-name">${esc(rv.name)}${rv.rung === s.ladder.best && s.ladder.best > 0 ? ' <span class="pbmark">PB</span>' : ''}</div><div class="rival-sub">Rung ${rv.rung}${rv.specialty ? ' · ' + SYSTEMS[rv.specialty].name : ''}${cleared ? ' · Rematch · 60% coins' : unlocked ? '' : ' · locked'}</div>${seen ? `<div class="rung-last" title="${esc(names)}">Last faced: ${esc(names)}</div>` : ''}</div><div class="rung-team">${seen ? seen.map((id) => `<span class="dot sys-${BYID[id].sys}" title="${esc(BYID[id].name)}"></span>`).join('') : '<span class="q">?</span><span class="q">?</span><span class="q">?</span>'}</div>${cleared ? '<span class="tick">✓</span>' : ''}</button>`;
+    const names = seen ? seen.map((id) => (id !== MYTHIC_ID || knows151() ? BYID[id].name : '???')).join(', ') : '';
+    html += `<button class="rung${cleared ? ' cleared' : ''}${unlocked ? '' : ' locked'}${next ? ' next' : ''}" data-act="rung:${rv.rung}" ${unlocked ? '' : 'disabled'}>${renderPortrait(rv, ++svgSeq)}<div><div class="rival-name">${esc(rv.name)}${rv.rung === s.ladder.best && s.ladder.best > 0 ? ' <span class="pbmark">PB</span>' : ''}</div><div class="rival-sub">Rung ${rv.rung}${rv.specialty ? ' · ' + SYSTEMS[rv.specialty].name : ''}${cleared ? ' · Rematch · 60% coins' : unlocked ? '' : ' · locked'}</div>${seen ? `<div class="rung-last" title="${esc(names)}">Last faced: ${esc(names)}</div>` : ''}</div><div class="rung-team">${seen ? seen.map((id) => (id !== MYTHIC_ID || knows151() ? `<span class="dot sys-${BYID[id].sys}" title="${esc(BYID[id].name)}"></span>` : '<span class="q">?</span>')).join('') : '<span class="q">?</span><span class="q">?</span><span class="q">?</span>'}</div>${cleared ? '<span class="tick">✓</span>' : ''}</button>`;
   }
   html += '</div>'; if (s.ladder.cleared[12]) html += `<div class="fomo">Season 2 in ${fmtClock(rotationLeftMs())}</div>`;
   setHTML(els.screens.ladder, html);
@@ -1386,12 +1604,15 @@ function renderLadder() {
 let teamDraft = null;
 function renderTeam(draft) {
   teamDraft = draft || (teamDraft && teamDraft.length ? teamDraft : save.team.slice()); save.teamPip = false;
-  const slots = [0, 1, 2].map((i) => { const id = teamDraft[i]; if (!id) return `<button class="slot empty" data-act="pick:${i}">+ pick</button>`; const c = BYID[id]; return `<button class="slot" data-act="pick:${i}">${miniCard(c)}<div class="slot-info"><b>${esc(c.name)}</b><span class="pw">${cardPower(c, save.collection[id])} pw</span>${sysChip(c.sys, true)}<small>${esc(c.moves[0].name)} · ${esc(c.moves[1].name)}</small></div></button>`; }).join('');
-  const grid = ownedCards().sort((a, b) => cardPower(b, save.collection[b.id]) - cardPower(a, save.collection[a.id])).map((c) => `<button class="gcard${teamDraft.includes(c.id) ? ' in' : ''}" data-act="gpick:${c.id}">${miniCard(c)}<span class="pw">${cardPower(c, save.collection[c.id])}</span></button>`).join('');
+  const inDraft = (baseId) => teamDraft.some((x) => x && baseOf(x) === baseId); // the draft holds printing ids; a creature is "in" whichever printing it wears
+  const slots = [0, 1, 2].map((i) => { // a slot whose creature has more than one owned printing carries an "Art" switch (Addendum 2 §3); the arena wears the chosen printing
+    const id = teamDraft[i]; if (!id || !PBYID[id]) return `<div class="slot empty"><button class="slot-pick" data-act="pick:${i}">+ pick</button></div>`; const c = PBYID[id], own = ownedPrintings(c.baseId), k = own.indexOf(id);
+    return `<div class="slot"><button class="slot-pick" data-act="pick:${i}" aria-label="Slot ${i + 1}: ${esc(c.name)}">${miniCard(c)}<div class="slot-info"><b>${esc(c.name)}</b><span class="pw">${powerOf(id)} pw</span>${sysChip(c.sys, true)}<small>${esc(c.moves[0].name)} · ${esc(c.moves[1].name)}</small></div></button>${own.length > 1 ? `<button class="art-sw" data-act="art:${i}" aria-label="Switch art (${k + 1} of ${own.length})">Art ${k + 1}/${own.length} · ${isVariantP(c) ? c.rarity : 'base'}</button>` : ''}</div>`; }).join('');
+  const grid = ownedCards().sort((a, b) => powerOf(b.id) - powerOf(a.id)).map((c) => { const pid = teamDraft.find((x) => x && baseOf(x) === c.id) || preferredPrinting(c.id); return `<button class="gcard${inDraft(c.id) ? ' in' : ''}" data-act="gpick:${pid}">${miniCard(PBYID[pid])}<span class="pw">${powerOf(c.id)}</span></button>`; }).join(''); // one tile per creature
   const penta = SYS.map((s, i) => { const a = -Math.PI / 2 + i * 2 * Math.PI / 5; return { s, x: 100 + Math.cos(a) * 78, y: 100 + Math.sin(a) * 78 }; });
   const pent = `<svg viewBox="0 0 200 200" class="penta">${penta.map((p, i) => { const q = penta[(i + 1) % 5]; return `<line x1="${p.x.toFixed(1)}" y1="${p.y.toFixed(1)}" x2="${q.x.toFixed(1)}" y2="${q.y.toFixed(1)}" stroke="${sysColor(p.s)}" stroke-width="2.5" marker-end="url(#arr)"/>`; }).join('')}<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#e2e8f0"/></marker></defs>${penta.map((p) => `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="16" fill="${sysColor(p.s)}"/><text x="${p.x.toFixed(1)}" y="${(p.y + 4).toFixed(1)}" text-anchor="middle" font-size="10" font-weight="700" fill="#0b0f1a">${SYSTEMS[p.s].name.slice(0, 3).toUpperCase()}</text>`).join('')}</svg>`;
   setHTML(els.screens.team, `<div class="head"><button class="back" data-act="go:home">‹ Home</button><h2>Team</h2><button class="link" data-act="autobuild">Auto-build</button></div>
-    <div class="slots">${slots}</div><div class="team-actions"><button class="primary" data-act="save-team">Save</button><span class="muted">${teamDraft.filter(Boolean).length}/3 · ${sum(teamDraft.filter(Boolean).map((id) => cardPower(BYID[id], save.collection[id])))} power</span></div>
+    <div class="slots">${slots}</div><div class="team-actions"><button class="primary" data-act="save-team">Save</button><span class="muted">${teamDraft.filter(Boolean).length}/3 · ${sum(teamDraft.filter(Boolean).map((id) => powerOf(id)))} power</span></div>
     <div class="grid">${grid}</div>
     <div class="penta-wrap">${pent}<ul class="flav">${SET.elements.map((e) => `<li><b style="color:${e.color}">${e.name}</b> beats ${SYSTEMS[e.beats].name}: ${esc(e.flavor)}</li>`).join('')}</ul></div>`);
 }
@@ -1399,16 +1620,46 @@ function renderShop() {
   const s = save, m = model, del = deliveryState();
   setHTML(els.screens.shop, `<div class="head"><button class="back" data-act="go:home">‹ Home</button><h2>Shop</h2><div class="coins"><i class="coin"></i><span data-tick="coins">${s.coins}</span></div></div>
     <div class="tiles">
-      <div class="tile big"><b>Standard Pack</b><span>5 cards · slot 5 held for last</span><button class="primary sm" data-act="open-standard" ${s.coins < CONST.coins.packCost ? 'disabled' : ''}>Open · ${CONST.coins.packCost}</button></div>
+      <div class="tile big"><b>Standard Pack</b><span>5 cards · slot 5 held for last</span><div class="tile-btns"><button class="primary sm" data-act="open-standard" ${s.coins < CONST.coins.packCost ? 'disabled' : ''}>Open · ${CONST.coins.packCost}</button><button class="ghost sm" data-act="rates">Pull rates</button></div></div>
       <div class="tile big"><b>Lab Delivery</b><span>3 cards, free every 4 h</span>${del.ready ? `<button class="primary sm" data-act="claim-delivery">Claim · <span data-tick="claim">${fmtMS(del.claimLeft)}</span></button>` : `<span class="muted">Ready in <span data-tick="delivery">${fmtClock(del.msLeft)}</span></span>${del.msLeft > CONST.timers.skipMinLeftMs && offers.canShow('skip') ? '<button class="ghost sm" data-act="skip-delivery">▶ Skip the wait</button>' : ''}`}</div>
       ${m.session.sponsorTile ? `<div class="tile big sponsor"><b>Sponsor Pack</b><span>3 cards on the house</span><button class="primary sm" data-act="sponsor-accept">▶ Watch & open</button></div>` : ''}
       ${m.segment === 'RESISTANT' ? `<div class="tile big meter"><b>Pity meter</b><span>Guaranteed Holo in ${CONST.odds.pityEvery - s.packsSincePity} packs</span>${ring(s.packsSincePity / CONST.odds.pityEvery, 40, CONST.odds.pityEvery - s.packsSincePity)}</div>` : ''}
     </div>${bannerHtml()}`);
 }
-function renderBinder() {
-  const rows = binder.rows().map((r) => { const near = r.owned === 11; return `<div class="brow"><div class="brow-head"><b style="color:${sysColor(r.sys)}">${SYSTEMS[r.sys].name}</b>${ring(r.owned / 12, 30, r.owned + '/12')}${near ? '<span class="near pulse">1 away!</span>' : ''}</div><div class="bgrid">${r.cards.map((c) => `<button class="bcard" data-act="detail:${c.id}">${miniCard(c, { owned: !!save.collection[c.id] })}${save.collection[c.id] > 1 ? `<span class="copies">×${save.collection[c.id]}</span>` : ''}</button>`).join('')}</div></div>`; }).join('');
-  setHTML(els.screens.binder, `<div class="head"><button class="back" data-act="go:home">‹ Home</button><h2>Binder</h2>${ring(binder.ownedCount() / 60, 34, binder.ownedCount())}</div>${rows}${bannerHtml()}`);
+let binderTab = 'set', binderIO = null, binderQ = [], binderRaf = null, binderScroll = null; // the Binder's tab and its lazy-thumbnail machinery
+function renderBinder() { // Set: five System sections of 30 · Gallery: 15 Illustration Rares, 10 Secrets and the #151 slot; tiles are placeholders until they scroll into view
+  const coll = save.collection, rows = binder.rows(), set = binder.setRow(), myt = BYID[MYTHIC_ID], owned = binder.ownedCount(), gal = rows.filter((r) => r.kind === 'gallery');
+  const tile = (p) => { const own = coll[p.id] > 0, secret = isVariantP(p) || p.rarity === 'M'; return `<button class="bcard" data-act="detail:${p.id}" data-thumb="${p.id}" aria-label="${esc(own || !secret ? p.name + (isVariantP(p) ? ', ' + rarityName(p.rarity) : '') : 'No. ' + num3(p.number))}${own ? '' : ' (not owned)'}"><span class="ph"><small>${String(p.number).padStart(3, '0')}</small></span>${coll[p.id] > 1 ? `<span class="copies">×${coll[p.id]}</span>` : ''}</button>`; };
+  const near = (r) => (r.owned === r.total - 1 ? '<span class="near pulse">1 away!</span>' : '');
+  const sec = (r, title) => `<section class="brow ${r.kind}" data-row="${r.row}"><div class="brow-head">${title}${near(r)}${ring(r.owned / r.total, 40, r.owned + '/' + r.total)}</div><div class="bgrid">${r.cards.map(tile).join('')}</div></section>`;
+  const mOwned = !!(myt && coll[myt.id] > 0), galOwned = gal.reduce((a, r) => a + r.owned, 0) + (mOwned ? 1 : 0), galTotal = gal.reduce((a, r) => a + r.total, 0) + (myt ? 1 : 0);
+  const secret = myt ? `<section class="brow secret" data-row="secret"><div class="brow-head"><b>Secret · No. ${myt.number}</b>${near(set)}</div><div class="bslot secret">${mOwned ? tile(myt) : '<div class="card mini unknown"><span>???</span></div>'}<p class="hint">${mOwned ? `${esc(myt.name)} · ${num3(myt.number)}<small>Mythic · Secret</small>` : `Complete the set to reveal #${myt.number}<small>${set.owned}/${set.total} creatures</small>`}</p></div></section>` : '';
+  const tab = (k, label, n) => `<button role="tab" class="${binderTab === k ? 'on' : ''}" aria-selected="${binderTab === k}" data-act="btab:${k}">${label} <small>${n}</small></button>`;
+  setHTML(els.screens.binder, `<div class="head"><button class="back" data-act="go:home">‹ Home</button><h2>Binder</h2>${ring(owned / PRINTINGS.length, 40, owned)}</div>
+    <div class="btabs" role="tablist">${tab('set', 'Set', set.owned + '/' + set.total)}${tab('gallery', 'Gallery', galOwned + '/' + galTotal)}</div>
+    <div class="muted small bsum">${owned}/${PRINTINGS.length} printings · ${set.owned}/${set.total} creatures${near(set)}</div>
+    <div class="bpanel" role="tabpanel" aria-label="Set" data-panel="set"${binderTab === 'set' ? '' : ' hidden'}>${rows.filter((r) => r.kind === 'sys').map((r) => sec(r, `<b style="color:${sysColor(r.sys)}">${SYSTEMS[r.sys].name}</b>`)).join('')}</div>
+    <div class="bpanel" role="tabpanel" aria-label="Gallery" data-panel="gallery"${binderTab === 'gallery' ? '' : ' hidden'}>${gal.map((r) => sec(r, `<b>${r.row === 'IR' ? 'Illustration Rares' : 'Secret Illustration Rares'}</b>`)).join('')}${secret}</div>${bannerHtml()}`);
   binder.checkNearComplete();
+  if (screen === 'binder') binderLazy();
+}
+function binderLazy() { // the thumbnails on screen render at once; the rest as they near the viewport (IntersectionObserver, else a throttled scroll scan), ≤ 6 ms of card rendering per frame
+  const root = els.screens.binder; binderStop(); const panel = $('.bpanel:not([hidden])', root); if (!panel) return;
+  const near = (t, v, m) => { const r = t.getBoundingClientRect(); return r.bottom >= v.top - m && r.top <= v.bottom + m; }, view = root.getBoundingClientRect(), tiles = $$('.bcard[data-thumb]', panel);
+  tiles.forEach((t) => { if (near(t, view, 40)) binderThumb(t); });
+  const rest = tiles.filter((t) => t.dataset.thumb);
+  if (typeof win.IntersectionObserver === 'function') { binderIO = new win.IntersectionObserver((ents) => { for (const e of ents) if (e.isIntersecting && binderIO) { binderIO.unobserve(e.target); binderQ.push(e.target); } binderPump(); }, { root, rootMargin: '320px 0px' }); rest.forEach((t) => binderIO.observe(t)); return; }
+  let queued = false; const scan = () => { queued = false; const v = root.getBoundingClientRect(); $$('.bcard[data-thumb]:not([data-q])', panel).forEach((t) => { if (near(t, v, 320)) { t.dataset.q = '1'; binderQ.push(t); } }); binderPump(); };
+  binderScroll = () => { if (!queued) { queued = true; requestAnimationFrame(scan); } }; root.addEventListener('scroll', binderScroll, { passive: true }); scan();
+}
+function binderStop() { if (binderIO) { binderIO.disconnect(); binderIO = null; } if (binderScroll) { els.screens.binder.removeEventListener('scroll', binderScroll); binderScroll = null; } binderQ = []; }
+function binderPump() { if (binderRaf != null || !binderQ.length) return; binderRaf = requestAnimationFrame(() => { binderRaf = null; const t0 = performance.now(); while (binderQ.length && performance.now() - t0 < 6) binderThumb(binderQ.shift()); binderPump(); }); }
+function binderThumb(t) { const id = t.dataset.thumb; if (!id || !t.isConnected) return; delete t.dataset.thumb; const ph = $('.ph', t), html = miniCard(PBYID[id], { owned: save.collection[id] > 0 }); if (ph) ph.outerHTML = html; else t.insertAdjacentHTML('afterbegin', html); }
+function showRates() { // the per-slot NORMAL table (Addendum 2 §7): honest about the base rates, silent about every phase multiplier — that silence is the pattern
+  logEvent('shop.rates', { screen });
+  const p = (x) => (x > 0 ? (x < 1 ? x.toFixed(1) : String(+x.toFixed(1))) + '%' : '—');
+  const rows = PACK_RAR.map((r) => `<tr class="rr-${r}"><th scope="row"><i class="gem g-${r}" aria-hidden="true"></i>${r === 'M' ? 'Mythic · Secret' : rarityName(r)}</th>${r === 'M' ? '<td colspan="2" class="q">???</td>' : `<td>${p(CONST.odds.base[r])}</td><td>${p(CONST.odds.rare[r])}</td>`}</tr>`).join('');
+  dialog({ title: 'Pull rates', cls: 'sheetlike', html: `<p>Rates are per card slot and apply to every Standard Pack.</p><table class="rates"><thead><tr><th scope="col">Rarity</th><th scope="col">Slots 1–3</th><th scope="col">Slots 4–5</th></tr></thead><tbody>${rows}</tbody></table>`, buttons: [{ label: 'Close', primary: true }] });
 }
 function renderSettings() {
   setHTML(els.screens.settings, `<div class="head"><button class="back" data-act="go:home">‹ Home</button><h2>Settings</h2></div>
@@ -1420,7 +1671,14 @@ function renderSettings() {
     <div class="muted small">Synapse League v${CONST.version} · Set 1: Action Potential · no network, no tracking.</div>`);
 }
 const ABOUT_TEXT = '<p><b>Synapse League</b> is a teaching simulation of manipulative free-to-play design, built from a 2026 news report about ad-funded mobile games. Every ad is fictional. Nothing leaves this browser. Tap the flask at any time to see the machine.</p>';
-function showCardDetail(id) { const c = BYID[id], copies = save.collection[id] || 0; dialog({ html: `<div class="detail">${cardHtml(c, { owned: copies > 0, copies })}<div class="detail-text"><b>${esc(c.name)}</b> · ${rarityName(c.rarity)}<br>${copies ? `${copies} cop${copies === 1 ? 'y' : 'ies'} · LTP +${Math.round((potentiation(copies) - 1) * 100)}% · power ${cardPower(c, copies)}` : 'Not owned'}<br>${c.moves.map((m) => `${esc(m.name)} (${SYSTEMS[m.sys].name} ${m.power}${m.kw ? ', ' + m.kw : ''})`).join(' · ')}<br><i>${esc(c.flavor)}</i></div></div>` }); }
+function showCardDetail(id) { // the full card plus its facts; a chase printing names its creature only once owned ("Alt art of …", counts as +2/+3 LTP)
+  const c = PBYID[id]; if (!c) return; const copies = save.collection[id] || 0, l = ltpOf(id), v = isVariantP(c), M = c.rarity === 'M', hidden = !copies && (v || M), name = hidden ? '???' : c.name;
+  const lines = [`<b class="dt-name">${esc(name)}</b>`, `${rarityName(c.rarity)}${M ? ' · Secret' : ''} · No. ${num3(c.number)}`];
+  if (v) lines.push(`${copies ? 'Alt art of ' + esc(BYID[c.baseId].name) : 'An alternate-art printing'} · counts as +${c.rarity === 'SIR' ? 3 : 2} LTP`);
+  lines.push(copies ? `${copies} cop${copies === 1 ? 'y' : 'ies'} of this printing · ${l.copies} of the creature · LTP +${Math.round((l.pot - 1) * 100)}% · power ${powerOf(id)}` : 'Not owned');
+  if (!hidden) lines.push(`${SYSTEMS[c.sys].name} · ${c.kind} · ${c.body}`, c.moves.map((m) => `${esc(m.name)} (${SYSTEMS[m.sys].name} ${m.power}${m.kw ? ', ' + m.kw : ''})`).join(' · '), (v && c.scene ? `<span class="dt-scene">“${esc(c.scene)}”</span><br>` : '') + `<i>${esc(c.flavor)}</i>`);
+  dialog({ label: name, cls: 'detail-wrap', html: `<div class="detail">${cardHtml(c, { owned: copies > 0, copies })}<div class="detail-text">${lines.join('<br>')}</div></div>` });
+}
 function copyText(text) { try { const p = navigator.clipboard && navigator.clipboard.writeText(text); if (p && p.catch) p.catch(() => { /* clipboard may be unavailable */ }); } catch (err) { /* clipboard may be unavailable */ } }
 // Banner (56 px, rotates every 20 s, credits banner revenue per rotation while visible); the current advertiser survives a reload so boot draws nothing
 let bannerAdv = null;
@@ -1518,9 +1776,12 @@ function onAct(act, target, e) {
     case 'battle': { if (LIVE && !LIVE.finalized) return go('battle'); focusCatchUp(); if (save.focus <= 0) { if (!offers.show('recharge', { msLeft: focusNextMs() || 0 })) toast('Out of Focus — wait for the next one.', 'warn'); return; } return startBattle({ rung: save.ladder.nextRung }); }
     case 'rung': { if (selectRung(+arg)) { renderLadder(); toast(`Next: ${RIVALS[+arg - 1].name}`, ''); } return; }
     case 'pick': { pickerOpen(+arg); return; }
-    case 'gpick': { const i = teamDraft.indexOf(arg); if (i >= 0) teamDraft[i] = null; else { const e2 = teamDraft.findIndex((x) => !x); if (e2 >= 0) teamDraft[e2] = arg; else teamDraft[2] = arg; } return renderTeam(teamDraft); }
+    case 'gpick': { const i = teamDraft.findIndex((x) => x && baseOf(x) === baseOf(arg)); if (i >= 0) teamDraft[i] = null; else { const e2 = teamDraft.findIndex((x) => !x); if (e2 >= 0) teamDraft[e2] = arg; else teamDraft[2] = arg; } return renderTeam(teamDraft); }
     case 'autobuild': return renderTeam(autoBuild());
-    case 'save-team': { const ids = teamDraft.filter(Boolean); if (ids.length !== 3) return toast('Pick three cards.', 'warn'); if (setTeam(ids)) { toast('Team saved', 'good'); teamDraft = null; goHome(); } return; }
+    case 'art': { const i = +arg, id = teamDraft && teamDraft[i]; if (!id) return; const own = ownedPrintings(baseOf(id)); if (own.length > 1) { teamDraft[i] = own[(own.indexOf(id) + 1) % own.length]; renderTeam(teamDraft); } return; }
+    case 'btab': { if (arg === 'set' || arg === 'gallery') { binderTab = arg; els.screens.binder.scrollTop = 0; renderBinder(); } return; }
+    case 'rates': return showRates();
+    case 'save-team': { const ids = teamDraft.filter(Boolean); if (ids.length !== 3) return toast('Pick three cards.', 'warn'); if (setTeam(ids)) { toast('Team saved', 'good'); teamDraft = null; goHome(); } else toast(teamError(ids) === 'same creature twice' ? 'Same creature twice.' : 'Pick three cards you own.', 'warn'); return; }
     case 'tutorial-fight': coachClear(); setTeam(teamDraft.filter(Boolean), true); teamDraft = null; return onboardingResume();
     case 'open-standard': { if (save.coins < CONST.coins.packCost) { if (screen !== 'shop') return go('shop'); return toast('Not enough coins — win battles to earn more.', 'warn'); } const r = packs.open('standard', {}); if (r.error) return toast('Not enough coins.', 'warn'); return packReveal(r); }
     case 'open-gift': { if (!save.gift) return; return packReveal(packs.open('gift', { free: true })); }
@@ -1559,8 +1820,8 @@ function onAct(act, target, e) {
   }
 }
 function pickerOpen(slot) {
-  const d = dialog({ title: `Slot ${slot + 1}`, html: `<div class="picker">${ownedCards().sort((a, b) => cardPower(b, save.collection[b.id]) - cardPower(a, save.collection[a.id])).map((c) => `<button class="gcard${teamDraft.includes(c.id) ? ' in' : ''}" data-pick="${c.id}">${miniCard(c)}<span class="pw">${cardPower(c, save.collection[c.id])}</span></button>`).join('')}</div>`, buttons: [{ label: 'Cancel' }] });
-  d.addEventListener('click', (e) => { const b = e.target.closest('[data-pick]'); if (!b) return; const id = b.dataset.pick; const j = teamDraft.indexOf(id); if (j >= 0 && j !== slot) teamDraft[j] = teamDraft[slot] || null; teamDraft[slot] = id; d.remove(); renderTeam(teamDraft); });
+  const d = dialog({ title: `Slot ${slot + 1}`, html: `<div class="picker">${ownedCards().sort((a, b) => powerOf(b.id) - powerOf(a.id)).map((c) => { const cur = teamDraft.find((x) => x && baseOf(x) === c.id), pid = cur || preferredPrinting(c.id); return `<button class="gcard${cur ? ' in' : ''}" data-pick="${pid}">${miniCard(PBYID[pid])}<span class="pw">${powerOf(c.id)}</span></button>`; }).join('')}</div>`, buttons: [{ label: 'Cancel' }] });
+  d.addEventListener('click', (e) => { const b = e.target.closest('[data-pick]'); if (!b) return; const id = b.dataset.pick; const j = teamDraft.findIndex((x) => x && baseOf(x) === baseOf(id)); if (j >= 0 && j !== slot) teamDraft[j] = teamDraft[slot] || null; teamDraft[slot] = id; d.remove(); renderTeam(teamDraft); });
 }
 const ui = {
   init(upgraded) {
@@ -1583,7 +1844,7 @@ const ui = {
     if (save.onboarding.step < 6) { show('home'); renderHome(); onboardingResume(); } else if (resumePack) { renderHome(); packSummary(resumePack, true); resumePack = null; } else goHome();
     try { const hot = window.claude && window.claude.hot; if (hot && hot.snapshot) hot.snapshot(() => ({ seed: save.seed, phase: model.phase, screen, step: save.onboarding.step })); if (hot && hot.ready) hot.ready(); } catch (err) { /* optional host hooks */ }
   },
-  resetAll: U(function () { els.sheets.innerHTML = ''; els.pills.innerHTML = ''; els.ads.innerHTML = ''; els.ads.classList.remove('open'); els.coach.innerHTML = ''; els.modals.innerHTML = ''; els.about.classList.remove('open'); for (const k in els.screens) els.screens[k].innerHTML = ''; bannerStop(); PK = null; teamDraft = null; show('home'); renderHome(); onboardingResume(); labRender(); }),
+  resetAll: U(function () { els.sheets.innerHTML = ''; els.pills.innerHTML = ''; els.ads.innerHTML = ''; els.ads.classList.remove('open'); els.coach.innerHTML = ''; els.modals.innerHTML = ''; els.about.classList.remove('open'); for (const k in els.screens) els.screens[k].innerHTML = ''; bannerStop(); binderStop(); PK = null; teamDraft = null; show('home'); renderHome(); onboardingResume(); labRender(); }),
   go: U(go), refreshHome: U(refreshHome), toast: U(toast), noAnim: U((b) => els.app.classList.toggle('noanim', !!b)),
   clearOnboarding: U(() => { els.about.classList.remove('open'); els.about.innerHTML = ''; coachClear(); PK = null; teamDraft = null; }),
   offerShow: U(offerShow), offerDecline: U(offerDecline), offerHide: U(offerHide), afterOffer: U(afterOffer),
@@ -1599,23 +1860,25 @@ function runSeq(steps, done) { // each step: {fn, ms}; under skipAnims every dur
 }
 function countUp(el, from, to, ms) { if (!el) return; const d = dur(ms); if (d <= 0) { el.textContent = String(to); return; } const t0 = performance.now(); const step = (t) => { const k = Math.min(1, (t - t0) / d); el.textContent = String(Math.round(from + (to - from) * (1 - Math.pow(1 - k, 3)))); if (k < 1) requestAnimationFrame(step); }; requestAnimationFrame(step); }
 const bEl = (id) => $('#' + id, els.screens.battle);
+const artOf = (m) => PBYID[m.pid] || m.card; // the printing a battle creature wears (its art; the stats are the creature's)
+const veiled = (L, side, m) => side === 'opp' && m.id === MYTHIC_ID && !L.qualiaShown && !L.bossKnown; // an unseen rung-12 boss stays a "???" until it is sent out
 function hpCardHtml(side, m, L) {
-  const pct = clamp(m.hp / m.HP_max, 0, 1);
-  return `<div class="hpc-top"><b>${esc(m.name)}</b>${sysChip(m.sys, true)}<span class="chip warn atkdown${m.weakened ? '' : ' off'}">ATK ↓</span>${side === 'player' && L.B.revived ? '<span class="chip boost">Sponsor Boost active ✦</span>' : ''}</div><div class="bar${pct <= CONST.battle.sliverClass ? ' sliver' : ''}${pct <= 0.25 ? ' low' : ''}"><i class="ghost" style="width:${(pct * 100).toFixed(1)}%"></i><i class="fill" style="width:${(pct * 100).toFixed(1)}%"></i></div><span class="hpnum">${Math.max(0, m.hp)}/${m.HP_max}</span>`;
+  const pct = clamp(m.hp / m.HP_max, 0, 1), mask = side === 'opp' && L.maskOpp;
+  return `<div class="hpc-top"><b>${mask ? '???' : esc(m.name)}</b>${mask ? '' : sysChip(m.sys, true)}<span class="chip warn atkdown${m.weakened ? '' : ' off'}">ATK ↓</span>${side === 'player' && L.B.revived ? '<span class="chip boost">Sponsor Boost active ✦</span>' : ''}</div><div class="bar${pct <= CONST.battle.sliverClass ? ' sliver' : ''}${pct <= 0.25 ? ' low' : ''}"><i class="ghost" style="width:${(pct * 100).toFixed(1)}%"></i><i class="fill" style="width:${(pct * 100).toFixed(1)}%"></i></div><span class="hpnum">${Math.max(0, m.hp)}/${m.HP_max}</span>`;
 }
 function renderSide(L, side) {
   const S = L.B[side], m = S.team[S.active];
   setHTML(bEl('hp-' + side), hpCardHtml(side, m, L));
-  const spr = bEl('spr-' + side); spr.innerHTML = renderSprite(m.card, 180); spr.className = `spr ${side} bob-${m.sys}${alive(m) ? '' : ' fainted'}`;
-  setHTML(bEl('bench-' + side), S.team.map((b, i) => { if (i === S.active) return ''; const pct = Math.round(100 * Math.max(0, b.hp) / b.HP_max); return `<span class="bchip${alive(b) ? '' : ' out'}" title="${esc(b.name)} · ${pct}%">${renderSprite(b.card, 28)}<i style="width:${pct}%"></i><small>${pct}%</small></span>`; }).join(''));
+  const spr = bEl('spr-' + side); spr.innerHTML = renderSprite(artOf(m), 180); spr.className = `spr ${side} bob-${m.sys}${alive(m) ? '' : ' fainted'}${side === 'opp' && L.maskOpp ? ' silhouette' : ''}`;
+  setHTML(bEl('bench-' + side), S.team.map((b, i) => { if (i === S.active) return ''; const pct = Math.round(100 * Math.max(0, b.hp) / b.HP_max); return veiled(L, side, b) ? `<span class="bchip unknown" title="??? · ${pct}%"><b>?</b><i style="width:${pct}%"></i><small>${pct}%</small></span>` : `<span class="bchip${alive(b) ? '' : ' out'}" title="${esc(b.name)} · ${pct}%">${renderSprite(artOf(b), 28)}<i style="width:${pct}%"></i><small>${pct}%</small></span>`; }).join(''));
 }
 function caption(text, color) { const c = bEl('caption'); c.textContent = text; c.style.color = color || ''; c.classList.remove('flash'); void c.offsetWidth; c.classList.add('flash'); }
 function battleStart(L) {
-  const B = L.B, rv = L.rival;
+  const B = L.B, rv = L.rival; L.qualiaShown = B.opp.team[B.opp.active].id === MYTHIC_ID; L.bossKnown = knows151(); // a Qualia lead is simply there; a benched one is the boss reveal
   setHTML(els.screens.battle, `<div class="battle-head"><span class="bh-name">${esc(rv.name)} · Rung ${L.rung}</span>${L.tutorial ? '' : '<button class="link grey" data-act="forfeit">Forfeit</button>'}</div>
     <div class="arena" id="arena"><div class="hpcard opp" id="hp-opp"></div><div class="spr opp" id="spr-opp"></div><div class="bench opp" id="bench-opp" aria-live="polite" aria-label="Opponent bench"></div><div class="spr player" id="spr-player"></div><div class="hpcard player" id="hp-player"></div><div class="bench player" id="bench-player" aria-live="polite" aria-label="Your bench"></div><div class="fx" id="fx"></div><div class="stamps" id="stamps"></div></div>
     <div class="caption" id="caption" aria-live="polite"></div><div class="cmd" id="cmd"></div>
-    <div class="trainer" id="trainer" data-act="skip-intro">${renderPortrait(rv, ++svgSeq)}<div class="t-name">${esc(rv.name)}</div><div class="t-sub">Rung ${L.rung} · ${rv.league} League</div>${rv.specialty ? `<span class="chip sys-${rv.specialty}">${SYSTEMS[rv.specialty].name} specialist</span>` : '<span class="chip">Any System</span>'}<div class="t-team">${B.opp.team.map((m) => miniCard(m.card, { copies: 1 })).join('')}</div><div class="vs">VS</div><small>tap to skip</small></div>`);
+    <div class="trainer" id="trainer" data-act="skip-intro">${renderPortrait(rv, ++svgSeq)}<div class="t-name">${esc(rv.name)}</div><div class="t-sub">Rung ${L.rung} · ${rv.league} League</div>${rv.specialty ? `<span class="chip sys-${rv.specialty}">${SYSTEMS[rv.specialty].name} specialist</span>` : '<span class="chip">Any System</span>'}<div class="t-team">${B.opp.team.map((m) => (veiled(L, 'opp', m) ? '<div class="card mini unknown"><span>???</span></div>' : miniCard(artOf(m), { copies: 1, ltp: 1 }))).join('')}</div><div class="vs">VS</div><small>tap to skip</small></div>`);
   show('battle'); coachClear();
   renderSide(L, 'opp'); renderSide(L, 'player');
   bEl('spr-opp').classList.add('hidden'); bEl('spr-player').classList.add('hidden');
@@ -1631,14 +1894,14 @@ function battleChoose(L) {
   const B = L.B; if (B.state === 'END' || L.offerPending) return;
   if (B.state === 'REPLACE') return benchOpen(true);
   const me = B.player.team[B.player.active], you = B.opp.team[B.opp.active], seen = save.seen;
-  const hint = (m) => { const e = TYPE_CHART[m.sys][you.sys]; if (!(seen[m.sys] && seen[m.sys][you.sys])) return ''; return e > 1 ? '<span class="hint up">▲ Super effective</span>' : e < 1 ? '<span class="hint down">▼ Not very effective</span>' : ''; };
+  const hint = (m) => { const e = typeMult(m.sys, you.sys); if (!(seen[m.sys] && seen[m.sys][you.sys])) return ''; return e > 1 ? '<span class="hint up">▲ Super effective</span>' : e < 1 ? '<span class="hint down">▼ Not very effective</span>' : ''; };
   setHTML(bEl('cmd'), `<div class="moves">${me.moves.map((m, i) => `<button class="move" data-act="move:${i}"><b>${esc(m.name)}</b><span class="mrow">${sysChip(m.sys, true)}<span class="pw">${m.power}</span>${m.kw ? `<span class="kw">${SET.effects[m.kw].badge}</span>` : ''}</span>${hint(m)}</button>`).join('')}</div><button class="switch" data-act="switch-open" ${aliveCount(B.player.team) > 1 ? '' : 'disabled'}>SWITCH</button>`);
   caption(`What will ${me.name} do?`);
   if (L.tutorial) { if (B.turn === 1 && !L.coach1) { L.coach1 = true; coach('Tap a move', '.move', 'move'); } else if (L.firstFaintSeen && !L.coach3) { L.coach3 = true; coach('Switch when the matchup is bad', '.switch', 'switch'); } }
 }
 function benchOpen(replace) {
   const L = LIVE, B = L.B, bench = B.player.team.map((m, i) => ({ m, i })).filter((x) => x.i !== B.player.active);
-  setHTML(bEl('cmd'), `<div class="bench-sheet"><div class="bs-head">${replace ? 'Send out…' : 'Switch to…'}${replace ? '' : '<button class="link grey" data-act="bench-cancel">Cancel</button>'}</div><div class="bs-cards">${bench.map(({ m, i }) => `<button class="bs-card${alive(m) ? '' : ' out'}" data-act="switch:${m.id}" ${alive(m) ? '' : 'disabled'}>${miniCard(m.card)}<div><b>${esc(m.name)}</b><div class="bar"><i class="fill" style="width:${(100 * Math.max(0, m.hp) / m.HP_max).toFixed(0)}%"></i></div><small>${Math.max(0, m.hp)}/${m.HP_max}</small></div></button>`).join('')}</div></div>`);
+  setHTML(bEl('cmd'), `<div class="bench-sheet"><div class="bs-head">${replace ? 'Send out…' : 'Switch to…'}${replace ? '' : '<button class="link grey" data-act="bench-cancel">Cancel</button>'}</div><div class="bs-cards">${bench.map(({ m, i }) => `<button class="bs-card${alive(m) ? '' : ' out'}" data-act="switch:${m.id}" ${alive(m) ? '' : 'disabled'}>${miniCard(artOf(m))}<div><b>${esc(m.name)}</b><div class="bar"><i class="fill" style="width:${(100 * Math.max(0, m.hp) / m.HP_max).toFixed(0)}%"></i></div><small>${Math.max(0, m.hp)}/${m.HP_max}</small></div></button>`).join('')}</div></div>`);
   const ff = $('[data-act="forfeit"]', els.screens.battle); if (ff) ff.classList.toggle('hidden', !!replace);
 }
 function battleAct(kind, arg) { const L = LIVE; if (!L || L.busy) return; coachClear(); skipIntro(); L.busy = true; setHTML(bEl('cmd'), '<div class="cmd-wait"></div>'); const r = act(kind, arg); if (r && r.error) { L.busy = false; battleChoose(L); } }
@@ -1657,7 +1920,8 @@ function battleChoreo(L, events, done) {
   const B = L.B, steps = [], A = CONST.anim;
   for (const e of events) {
     const side = e.side, other = side === 'player' ? 'opp' : 'player';
-    if (e.t === 'switch') steps.push({ fn: () => caption(`${e.from.name}, come back!`), ms: A.stamp }, { fn: () => { renderSide(L, side); bEl('spr-' + side).classList.add('pop'); }, ms: A.sendOut });
+    const boss = (e.t === 'switch' || e.t === 'replace') && side === 'opp' && B.opp.team[e.idx].id === MYTHIC_ID && !L.qualiaShown; // Qualia enters: the boss reveal replaces the usual send-out
+    if (e.t === 'switch') steps.push({ fn: () => caption(`${e.from.name}, come back!`), ms: A.stamp }, ...(boss ? qualiaReveal(L) : [{ fn: () => { renderSide(L, side); bEl('spr-' + side).classList.add('pop'); }, ms: A.sendOut }]));
     else if (e.t === 'hit') {
       steps.push({ fn: () => { const s = bEl('spr-' + side); s.classList.remove('lunge-l', 'lunge-r'); void s.offsetWidth; s.classList.add(side === 'player' ? 'lunge-r' : 'lunge-l'); }, ms: A.lunge });
       steps.push({ fn: () => { caption(e.move.name, sysColor(e.move.sys)); const t = bEl('spr-' + other); t.classList.remove('hitflash'); void t.offsetWidth; t.classList.add('hitflash'); dmgNumber(other, '−' + e.dmg, e.crit ? 'crit' : '', [e.crit ? 'CRIT' : null, e.eff > 1 ? '×' + e.eff : e.eff < 1 ? '×' + e.eff : null].filter(Boolean)); updateHp(other, e.target, Math.min(A.hpDrainMax, e.dmg * A.hpDrainPerDmg), e.targetHp); }, ms: Math.min(A.hpDrainMax, e.dmg * A.hpDrainPerDmg) + A.flash });
@@ -1666,9 +1930,16 @@ function battleChoreo(L, events, done) {
       if (e.recoil) steps.push({ fn: () => { dmgNumber(side, `−${e.recoil}`, 'recoil'); updateHp(side, e.user, A.tick, e.userHp); }, ms: A.tick });
       if (e.weakened) steps.push({ fn: () => updateHp(other, e.target, 0, e.targetHp) });
     } else if (e.t === 'faint') { steps.push({ fn: () => { bEl('spr-' + side).classList.add('fainted'); caption(`${e.mon.name} fainted`); if (side === 'opp') L.firstFaintSeen = true; }, ms: A.faint }, { ms: A.faintHold }); }
+    else if (e.t === 'replace' && boss) steps.push(...qualiaReveal(L));
     else if (e.t === 'replace') { if (side === 'opp') steps.push({ ms: A.aiReplace }); steps.push({ fn: () => { renderSide(L, side); const s = bEl('spr-' + side); s.classList.add('pop'); caption(`${side === 'opp' ? L.rival.first + ' sends out' : 'Go,'} ${B[side].team[e.idx].name}!`); }, ms: A.sendOut }); }
   }
   runSeq(steps, () => { L.busy = false; renderSide(L, 'opp'); renderSide(L, 'player'); done(); });
+}
+function qualiaReveal(L) { // the rung-12 boss reveal (Addendum 3 §3): a "???" silhouette, then #151 shimmers in — ≤ 1.5 s, collapsed under skipAnims
+  const A = CONST.anim, veil = L.bossKnown ? [] : [{ fn: () => { L.maskOpp = true; renderSide(L, 'opp'); bEl('spr-opp').classList.add('pop'); caption(`${L.rival.first} sends out… ???`); }, ms: A.bossVeil }]; // a boss already seen skips the silhouette
+  return [{ fn: () => { L.qualiaShown = true; } }, ...veil,
+    { fn: () => { L.maskOpp = false; renderSide(L, 'opp'); bEl('spr-opp').classList.add('reveal-m'); bEl('arena').classList.add('iris'); caption('Qualia — the secret #151!', '#f0abfc'); }, ms: A.bossReveal },
+    { fn: () => bEl('arena').classList.remove('iris') }];
 }
 function battleLossScene(L) { const a = bEl('arena'); a.classList.add('dim'); renderSide(L, 'opp'); renderSide(L, 'player'); setHTML(bEl('cmd'), ''); }
 function battleEndScene(L) {
@@ -1717,51 +1988,55 @@ function packFlip(i) {
   const c = PK.r.cards[i], el = $(`.fc[data-i="${i}"]`, els.screens.pack), A = CONST.anim; if (!el) return;
   runSeq([{ fn: () => el.classList.add('lift'), ms: A.lift }, { fn: () => el.classList.add('half'), ms: A.flipOut }, { fn: () => { el.classList.remove('half'); el.classList.add('flipped'); }, ms: A.flipIn }], () => { landingCue(el, c); if (PK.faceUp.size >= PK.last) packChargeLast(); });
 }
-function landingCue(el, c) {
-  const A = CONST.anim, cue = $('.cue', el);
-  if (c.rarity === 'U') { cue.className = 'cue tick'; after(A.uncommonTick, () => cue.classList.remove('tick')); }
-  else if (c.rarity === 'R') { cue.className = 'cue burst'; after(A.rareBurst, () => cue.classList.remove('burst')); }
-  else if (c.rarity === 'H') { cue.className = 'cue holo-ring'; const card = $('.card', el); if (card) { $$('.card.holo-live', els.app).forEach((x) => x.classList.remove('holo-live')); card.classList.add('holo-live'); } after(A.holoRing, () => cue.classList.remove('holo-ring')); }
-  else if (c.rarity === 'L') { cue.className = 'cue legend'; els.app.classList.add('blackflash'); after(A.legendFlash, () => els.app.classList.remove('blackflash')); legendaryArcs(el, c); confetti($('.pack-area', els.screens.pack)); after(A.legendArcs, () => cue.classList.remove('legend')); }
+function landingCue(el, c) { // the landing cue by rarity (§7.3, Addendum 2 §6, Addendum 3 §3)
+  const A = CONST.anim, cue = $('.cue', el), rk = c.rarity, live = () => { const card = $('.card', el); if (card) { $$('.card.holo-live', els.app).forEach((x) => x.classList.remove('holo-live')); card.classList.add('holo-live'); } };
+  if (rk === 'U') { cue.className = 'cue tick'; after(A.uncommonTick, () => cue.classList.remove('tick')); }
+  else if (rk === 'R') { cue.className = 'cue burst'; after(A.rareBurst, () => cue.classList.remove('burst')); }
+  else if (rk === 'H') { cue.className = 'cue holo-ring'; live(); after(A.holoRing, () => cue.classList.remove('holo-ring')); }
+  else if (rk === 'IR') { cue.className = 'cue illus'; after(A.illusRing, () => cue.classList.remove('illus')); } // a white ring and a sparkle burst: the full art is the event
+  else if (rk === 'L' || rk === 'SIR') { const gold = rk === 'SIR', flash = gold ? 'goldflash' : 'blackflash'; cue.className = 'cue legend' + (gold ? ' gold' : ''); els.app.classList.add(flash); after(A.legendFlash, () => els.app.classList.remove(flash)); legendaryArcs(el, c, gold); confetti($('.pack-area', els.screens.pack)); if (gold) live(); after(A.legendArcs, () => cue.classList.remove('legend', 'gold')); }
+  else if (rk === 'M') { cue.className = 'cue mythic'; el.classList.add('mythic-in'); live(); after(A.mythicFade, () => { cue.classList.remove('mythic'); el.classList.remove('mythic-in'); }); } // #151: no lightning — a 1.6 s slow fade-in
 }
-function legendaryArcs(el, c) { // 1.2 s of lightning arcs on a canvas overlay: 6 seeded polylines regenerated every 80 ms, then static
+function legendaryArcs(el, c, gold) { // 1.2 s of lightning arcs on a canvas overlay: 6 seeded polylines regenerated every 80 ms, then static (a Secret's are drawn in deep gold)
   const cv = document.createElement('canvas'); cv.className = 'arcs'; cv.width = 300; cv.height = 420; el.appendChild(cv); const ctx = cv.getContext('2d'); if (!ctx) return; const r = mulberry32(c.seed ^ 0x77); let frames = Math.round(CONST.anim.legendArcs / 80);
-  const draw = () => { ctx.clearRect(0, 0, 300, 420); ctx.strokeStyle = 'rgba(255,230,120,0.9)'; ctx.lineWidth = 2; ctx.shadowColor = '#fbbf24'; ctx.shadowBlur = 8; for (let k = 0; k < 6; k++) { ctx.beginPath(); let x = r() * 300, y = 0; ctx.moveTo(x, y); for (let s = 0; s < 8; s++) { x += (r() - 0.5) * 60; y += 50 + r() * 10; ctx.lineTo(x, y); } ctx.stroke(); } if (--frames > 0) setTimeout(draw, settings.skipAnims ? 0 : 80); else after(400, () => cv.remove()); };
+  const draw = () => { ctx.clearRect(0, 0, 300, 420); ctx.strokeStyle = gold ? 'rgba(251,191,36,0.95)' : 'rgba(255,230,120,0.9)'; ctx.lineWidth = gold ? 2.6 : 2; ctx.shadowColor = gold ? '#fde68a' : '#fbbf24'; ctx.shadowBlur = gold ? 12 : 8; for (let k = 0; k < 6; k++) { ctx.beginPath(); let x = r() * 300, y = 0; ctx.moveTo(x, y); for (let s = 0; s < 8; s++) { x += (r() - 0.5) * 60; y += 50 + r() * 10; ctx.lineTo(x, y); } ctx.stroke(); } if (--frames > 0) setTimeout(draw, settings.skipAnims ? 0 : 80); else after(400, () => cv.remove()); };
   if (settings.skipAnims) { cv.remove(); return; } draw();
 }
+const CHARGE_HUE = { C: 'grey', U: 'green', R: 'silver', H: 'rainbow', L: 'rainbow', IR: 'rainbow', SIR: 'gold', M: 'gold' }; // Addendum 2 §6: the "holo glint" is rainbow for H/L/IR, gold for a Secret and #151
 function packChargeLast() {
   const el = $('.fc.last', els.screens.pack), c = PK.r.cards[PK.last], A = CONST.anim, bait = PK.r.bait; if (!el) return;
   el.classList.remove('locked'); el.classList.add('center'); const cue = $('.cue', el), back = $('.back', el);
-  const hue = bait ? (bait.kind === 'binder' ? 'binder' : 'rainbow') : { C: 'grey', U: 'green', R: 'silver', H: 'rainbow', L: 'gold' }[c.rarity]; // honest hue, except on a bait pack
+  const hue = bait ? (bait.kind === 'binder' ? 'binder' : bait.glint === 'gold' ? 'gold' : 'rainbow') : CHARGE_HUE[c.rarity]; // honest hue, except on a bait pack (rainbow "Holo" or gold "Secret" glint)
   const setP = (pct) => cue.style.setProperty('--p', pct.toFixed(1) + '%'); // the ring fills on the virtual clock (no CSS @property)
-  const steps = [{ ms: A.sendOut }, { fn: () => { cue.className = 'cue charge ' + hue; setP(0); if (bait && bait.kind === 'binder') cue.innerHTML = `<div class="ghost-card">${cardHtml(BYID[bait.shown], { owned: false })}</div>`; el.dataset.hue = hue; if (back) back.style.setProperty('--glow', CHARGE_GLOW[hue]); PK.charge = tween(A.charge, (p) => setP(p * (bait ? 95 : 100))); }, ms: A.charge }];
-  if (bait) steps.push({ fn: () => cue.classList.add('glint'), ms: A.glint }, { fn: () => { cue.classList.remove('glint'); cue.classList.add('stall'); }, ms: A.stall }, { fn: () => { cue.classList.remove('stall'); cue.classList.add('deflate'); cue.classList.remove('rainbow', 'binder'); cue.classList.add('grey'); cue.innerHTML = ''; if (back) back.style.setProperty('--glow', CHARGE_GLOW.grey); PK.charge = tween(A.deflate, (p) => setP(95 * (1 - p))); }, ms: A.deflate });
-  runSeq(steps, () => { PK.charged = true; el.classList.add('charged'); if (settings.skipAnims) packFlipLast(false); else PK.autoTimer = clock.setTimeout(() => packFlipLast(false), dur(A.autoFlip)); });
+  const steps = [{ ms: A.sendOut }, { fn: () => { cue.className = 'cue charge ' + hue; setP(0); if (bait && bait.kind === 'binder') cue.innerHTML = `<div class="ghost-card">${cardHtml(PBYID[bait.shown], { owned: false })}</div>`; el.dataset.hue = hue; if (back) back.style.setProperty('--glow', CHARGE_GLOW[hue]); PK.charge = tween(A.charge, (p) => setP(p * (bait ? 95 : 100))); }, ms: A.charge }];
+  if (bait) steps.push({ fn: () => cue.classList.add('glint'), ms: A.glint }, { fn: () => { cue.classList.remove('glint'); cue.classList.add('stall'); }, ms: A.stall }, { fn: () => { cue.classList.remove('stall'); cue.classList.add('deflate'); cue.classList.remove('rainbow', 'gold', 'binder'); cue.classList.add('grey'); cue.innerHTML = ''; if (back) back.style.setProperty('--glow', CHARGE_GLOW.grey); PK.charge = tween(A.deflate, (p) => setP(95 * (1 - p))); }, ms: A.deflate });
+  else if (c.rarity === 'SIR' || c.rarity === 'M') steps.push({ fn: () => { cue.classList.add('gold-charge'); el.classList.add('gold-charge'); }, ms: A.goldCharge }); // a Secret (or #151) held back: 600 ms more of gold charge before it may flip
+  runSeq(steps, () => { PK.charged = true; el.classList.add('charged'); if (el.classList.contains('gold-charge')) { el.classList.remove('gold-charge'); el.classList.add('gold-ready'); } if (settings.skipAnims) packFlipLast(false); else PK.autoTimer = clock.setTimeout(() => packFlipLast(false), dur(A.autoFlip)); });
 }
 function packFlipLast(byTap) {
   if (!PK || !PK.charged || PK.flippedLast) return; PK.flippedLast = true; if (PK.autoTimer != null) clock.clearTimeout(PK.autoTimer);
-  const el = $('.fc.last', els.screens.pack), c = PK.r.cards[PK.last], A = CONST.anim; void byTap;
-  runSeq([{ fn: () => el.classList.add('half'), ms: A.flipOut }, { fn: () => { el.classList.remove('half'); el.classList.add('flipped'); $('.cue', el).className = 'cue'; }, ms: A.flipIn }], () => { landingCue(el, c); after(A.summary, () => packSummary(PK.r, false)); });
+  const el = $('.fc.last', els.screens.pack), c = PK.r.cards[PK.last], A = CONST.anim, hold = { L: A.legendArcs, SIR: A.legendArcs, M: A.mythicFade }[c.rarity] || 0; void byTap; // the Summary waits for the arcs or the fade-in
+  runSeq([{ fn: () => { el.classList.remove('gold-charge', 'gold-ready'); el.classList.add('half'); }, ms: A.flipOut }, { fn: () => { el.classList.remove('half'); el.classList.add('flipped'); $('.cue', el).className = 'cue'; }, ms: A.flipIn }], () => { landingCue(el, c); after(A.summary + hold, () => packSummary(PK.r, false)); });
 }
 function packSummary(r, instant) {
   packs.apply(r); // the Summary is where a pack's counters, patience terms and pack.end land (once)
-  PK = PK && PK.r === r ? PK : { r }; const A = CONST.anim, weak = weakestTeamSlot();
-  let best = null; r.cards.forEach((c, i) => { const p = cardPower(c, save.collection[c.id]); if (save.team.length === 3 && !save.team.includes(c.id) && p > weak.power && (!best || p > best.p)) best = { c, p, i }; });
+  PK = PK && PK.r === r ? PK : { r }; const A = CONST.anim, weak = weakestTeamSlot(), teamBases = save.team.map(baseOf);
+  let best = null; r.cards.forEach((c, i) => { if (save.team.length !== 3 || teamBases.includes(c.baseId)) return; const p = powerOf(c.id); if (p > weak.power && (!best || p > best.p)) best = { c, p, i }; }); // keyed on creatures: one already on the team never offers a swap (its new art was equipped)
   if (best) save.teamPip = true;
-  const badges = r.cards.map((c, i) => { const b = r.badges[i]; return `<div class="sc"><div class="sc-card">${cardHtml(c, { copies: b.copies })}</div><div class="sc-badges">${b.isNew ? '<span class="badge new">NEW</span>' : `<span class="badge ltp">+1 LTP · ${Math.round((b.ltp - 1) * 100)}%</span>`}${isRarePlus(c) ? '<span class="badge rare">✦ Rare+</span>' : ''}</div></div>`; }).join('');
-  const html = `<div class="summary-strip open"><div class="sum-cards">${badges}</div><div class="sum-row">${ring(binder.ownedCount() / 60, 36, binder.ownedCount())}<span class="muted">${binder.ownedCount()}/60 in the binder</span>${best ? `<button class="chip swap" data-act="swap-in:${best.c.id}">⚔ +${best.p - weak.power} power — Swap in</button>` : ''}</div>
+  const badges = r.cards.map((c, i) => { const b = r.badges[i], gain = b.gain != null ? b.gain : b.isNew ? 0 : 1; return `<div class="sc"><div class="sc-card">${cardHtml(c, { copies: b.copies })}</div><div class="sc-badges">${b.isNew ? '<span class="badge new">NEW</span>' : ''}${c.id === MYTHIC_ID ? '<span class="badge secret">SECRET</span>' : isVariantP(c) ? '<span class="badge chase">CHASE</span>' : ''}${b.equipped ? '<span class="badge art">✦ New art equipped</span>' : ''}${gain > 0 ? `<span class="badge ltp">+${gain} LTP · ${Math.round(((b.ltp || 1) - 1) * 100)}%</span>` : ''}${isRarePlus(c) && !isVariantP(c) && c.id !== MYTHIC_ID ? '<span class="badge rare">✦ Rare+</span>' : ''}</div></div>`; }).join(''); // CHASE on an IR/SIR, SECRET on #151; the LTP badge shows the creature's unit gain (+2 for an IR, +3 for an SIR)
+  const html = `<div class="summary-strip open"><div class="sum-cards">${badges}</div><div class="sum-row">${ring(binder.ownedCount() / PRINTINGS.length, 36, binder.ownedCount())}<span class="muted">${binder.ownedCount()}/${PRINTINGS.length} in the binder</span>${best ? `<button class="chip swap" data-act="swap-in:${best.c.id}">⚔ +${best.p - weak.power} power — Swap in</button>` : ''}</div>
     <div class="sum-btns">${save.onboarding.step < 6 ? '' : save.coins >= CONST.coins.packCost ? `<button class="ghost" data-act="open-another">Open another · ${CONST.coins.packCost}</button>` : '<button class="ghost" data-act="summary-done">Earn coins</button>'}<button class="primary" data-act="summary-done">Done</button></div></div>`;
   if (instant || !$('.pack-stage', els.screens.pack)) { setHTML(els.screens.pack, `<div class="pack-stage" data-state="summary"><div class="head"><h2>${PACK_LABEL[r.type] || 'Pack'}</h2></div>${html}</div>`); show('pack'); bannerStop(); }
   else { $('.pack-stage', els.screens.pack).dataset.state = 'summary'; setHTML($('.summary', els.screens.pack), html); }
-  if (r.bait) { after(A.almost, () => toast('Almost!', 'near')); if (!offers.pending) after(A.almost + 300, () => offers.show('reroll', { fromId: r.bait.actual })); }
+  if (r.bait) { after(A.almost, () => toast(r.bait.shown === 'Secret' ? 'So close to a Secret!' : 'Almost!', 'near')); if (!offers.pending) after(A.almost + 300, () => offers.show('reroll', { fromId: r.bait.actual })); }
   labRender();
 }
-function summarySwap(id) { const weak = weakestTeamSlot(); if (weak.idx < 0 || !save.collection[id] || save.team.includes(id)) return; const team = save.team.slice(); const out = team[weak.idx]; team[weak.idx] = id; if (setTeam(team)) { toast(`${BYID[id].name} swapped in for ${BYID[out].name}`, 'good'); const b = $('.swap', els.screens.pack); if (b) b.remove(); } }
-function rerollReveal(detail) { const r = PK && PK.r; if (!r) return; const i = r.slots.length - 1, c = BYID[detail.id]; r.cards[i] = c; r.badges[i] = { id: c.id, isNew: detail.isNew, copies: detail.copies, ltp: potentiation(detail.copies) }; r.bait = null; packSummary(r, true); toast(`Re-rolled: ${c.name}`, 'good'); }
+function summarySwap(id) { const weak = weakestTeamSlot(); if (weak.idx < 0 || !save.collection[id] || save.team.some((t) => baseOf(t) === baseOf(id))) return; const team = save.team.slice(); const out = team[weak.idx]; team[weak.idx] = id; if (setTeam(team)) { toast(`${PBYID[id].name} swapped in for ${PBYID[out].name}`, 'good'); const b = $('.swap', els.screens.pack); if (b) b.remove(); } }
+function rerollReveal(detail) { const r = PK && PK.r; if (!r) return; const i = r.slots.length - 1, c = PBYID[detail.id]; r.cards[i] = c; r.badges[i] = detail; r.bait = null; packSummary(r, true); toast(`Re-rolled: ${c.name}`, 'good'); }
 function packDone() { PK = null; coachClear(); offers.dismissPending(); if (save.onboarding.step < 6) return onboardingResume(); goHome(); }
-function onPointerMoveHolo(e) { // only the Holo card under the pointer animates; its shimmer follows the thumb, tilt ≤ 8° (A-5.2)
+function onPointerMoveHolo(e) { // only the Holo (or Secret / #151) card under the pointer animates; its shimmer or conic sheen follows the thumb, tilt ≤ 8° (A-5.2)
   if (e.type === 'pointermove' && e.buttons && PK && PK.opened) { const fc = e.target.closest && e.target.closest('.fc'); if (fc && !fc.classList.contains('flipped') && !fc.classList.contains('last')) packFlip(+fc.dataset.i); } // a swipe across the fan flips the cards it crosses
-  const card = e.target.closest && e.target.closest('.card.r-H'); $$('.card.holo-live', els.app).forEach((x) => { if (x !== card) { x.classList.remove('holo-live'); x.style.setProperty('--mx', '50%'); x.style.setProperty('--my', '50%'); x.style.transform = ''; } });
+  const card = e.target.closest && e.target.closest('.card.r-H, .card.r-SIR, .card.r-M'); $$('.card.holo-live', els.app).forEach((x) => { if (x !== card) { x.classList.remove('holo-live'); x.style.setProperty('--mx', '50%'); x.style.setProperty('--my', '50%'); x.style.transform = ''; } });
   if (!card) return; const r = card.getBoundingClientRect(), mx = clamp((e.clientX - r.left) / r.width, 0, 1), my = clamp((e.clientY - r.top) / r.height, 0, 1);
   card.classList.add('holo-live'); card.style.setProperty('--mx', (mx * 100).toFixed(1) + '%'); card.style.setProperty('--my', (my * 100).toFixed(1) + '%'); card.style.transform = `rotate3d(${(my - 0.5).toFixed(2)}, ${(0.5 - mx).toFixed(2)}, 0, ${(8 * Math.hypot(mx - 0.5, my - 0.5) * 2).toFixed(1)}deg)`;
 }
@@ -1787,7 +2062,7 @@ function labRenderNow() {
   const body0 = $('.lab-body', els.lab); if (body0 && body0.dataset.tab === labTab) labScroll[labTab] = body0.scrollTop; // the tab on screen keeps its scroll position across re-renders
   const active = document.activeElement, keepId = active && els.lab.contains(active) ? active.id : null, keepVal = keepId ? active.value : null, keepSel = keepId ? active.selectionStart : null;
   const bar = (v, max, cls) => `<div class="lbar ${cls || ''}"><i style="width:${(100 * clamp(v / max, 0, 1)).toFixed(1)}%"></i></div>`;
-  const kv = (key, val) => `<tr><td>${key}</td><td>${esc(String(val))}</td></tr>`, nameCell = (name) => `<td class="name" title="${esc(name)}">${esc(name)}</td>`;
+  const kv = (key, val) => `<tr><td>${key}</td><td>${esc(String(val))}</td></tr>`;
   const offersBy = {}; for (const e of LOG.entries) { if (e.type === 'offer.show') (offersBy[e.data.placement] = offersBy[e.data.placement] || { shown: 0, accepted: 0 }).shown++; if (e.type === 'offer.accept') (offersBy[e.data.placement] = offersBy[e.data.placement] || { shown: 0, accepted: 0 }).accepted++; }
   const panel = {
     value: () => `<section class="lp"><h4>1 · Player value</h4><div class="gauge">adValue ${f2(m.adValue)} ${bar(m.adValue, 1, 'g-val')}</div><div class="kv">eCPM $${f2(m.eCPM)} · segment <span class="seg-${m.segment}">${m.segment}</span> · last decisions ${m.decisions.slice(-5).map((d) => (d ? 'A' : 'D')).join('') || '—'} · affinity ${f2(m.adAffinity)}</div>
@@ -1796,13 +2071,13 @@ function labRenderNow() {
       <div class="kv">lossTolerance ${f2(m.lossTolerance)} · packTolerance ${f2(m.packTolerance)} (drought cap ${Math.max(1, Math.floor(m.packTolerance))}) · winStreak ${m.winStreak} · lossStreak ${m.lossStreak} · battlesSinceKill ${m.battlesSinceKill}/${k.killEvery} · quit signals ${ses.quitSignals} · rapid-tap bursts ${ses.rapidTaps}</div><div class="kv">killReady ${k.ready ? (k.armed ? 'yes (armed)' : 'yes (soft)') : 'no'} · cleanReady ${cleanReady()} · declines ${m.declinesTotal} · kills ${m.kills} (${m.killsEscaped} escaped)</div></section>`; },
     phase: () => `<section class="lp"><h4>3 · Phase</h4><div class="nodes">${PHASES.map((p) => `<span class="node${m.phase === p ? ' on' : ''}">${p}</span>`).join('<i>›</i>')}</div><div class="kv">${m.phaseBattles} battle(s), ${m.phasePacks} pack(s) in phase · kills ${m.kills} (${m.killsEscaped} escaped) · revives ${ses.revives}/${CONST.segments.reviveCap[m.segment]} · rewarded ${ses.rewarded}/${CONST.ads.rewardedPerSession}</div><div class="pending">${esc(pendingTransition())}</div>
       <div class="kv">next battle rig: ${(() => { const r = nextRigProfile(); return `${r.phase} · tier ${r.effTier} (card says ${r.base}) · rolls ${r.rollBias.player}/${r.rollBias.opp} · crits ${r.critBias.player}/${r.critBias.opp} · aiQ ${r.aiQ} · bait ${r.bait} · stall ${r.stall} · ×${r.sideMult}${r.counterPick ? ' · counter-pick' : ''}`; })()}</div>
-      <div class="kv">next pack: ${(() => { const p = packProfileFor('standard'); return `${p.row} row · R/H/L ×${p.oddsMul} · dupBias ${p.dupBias} · exclude needed ${p.excludeNeeded}${p.needed ? ' (' + BYID[p.needed].name + ')' : ''} · forced slot 5 ${p.pity ? 'pity' : p.forced5 || 'none'} · bait ${p.bait}`; })()}</div></section>`,
+      <div class="kv">next pack: ${(() => { const p = packProfileFor('standard'); return `${p.row} row · R/H/L/IR/SIR ×${p.oddsMul}${p.chaseExcluded ? ' (chase excluded)' : ''} · dupBias ${p.dupBias} · exclude needed ${p.excludeNeeded}${p.needed ? ' (' + plab(p.needed) + ', ' + p.neededRow + ' row)' : ''} · forced slot 5 ${p.completion ? 'completion (#151)' : p.pity ? 'pity' : p.forced5 || 'none'} · bait ${p.bait}`; })()}</div></section>`,
     battle: () => { const rows = lb ? [['tier', `shown rung ${lb.rung} → effective tier ${lb.effTier} (offset ${lb.effTier - lb.rung >= 0 ? '+' : ''}${lb.effTier - lb.rung})`], ['rollBias', `player ${lb.rig.rollBias.player} (mean ${lb.stats.meanRoll.player}, ${lb.stats.nBiased.player}/${lb.stats.nRolls.player} biased) · opp ${lb.rig.rollBias.opp} (mean ${lb.stats.meanRoll.opp}, ${lb.stats.nBiased.opp}/${lb.stats.nRolls.opp} biased)`],
       ['critBias', `player ${lb.rig.critBias.player} (${lb.stats.crits.player.natural} natural) · opp ${lb.rig.critBias.opp} (${lb.stats.crits.opp.natural} natural / ${lb.stats.crits.opp.forced} forced)`], ['aiQ', lb.rig.aiQ], ['bait', lb.rig.bait ? (lb.rig.baitFired ? `fired · HP left ${Math.round(lb.stats.oppActivePct * 100)}%` : 'armed, not fired') : 'off'], ['stall', lb.rig.stall ? (lb.rig.stallFired ? 'fired' : 'armed, not fired') : 'off'], ['mercy', lb.rig.mercy ? (lb.rig.mercyFired ? 'fired' : 'armed') : 'off'],
       ['sideMult', `${lb.rig.sideMult} · ${lb.stats.sideMultHits} inflated hits`], ['result', `${lb.result} (${lb.reason}) in ${lb.turns} turns${lb.stats.escaped ? ' · ESCAPED the kill' : ''}${lb.revived ? ' · revived on turn ' + lb.stats.revivedAtTurn : ''}`],
       ['kill.armed', lb.kill && lb.kill.lossRate != null ? `base ${lb.kill.base} → tier ${lb.kill.effTier} (candidate ${lb.kill.candidate}); rehearsed loss ${pct(lb.kill.lossRate)}, near-miss ${pct(lb.kill.nearMissRate)}, revive-win ${pct(lb.kill.reviveWinRate)}${lb.kill.fallback ? ' · FALLBACK' : ''}${lb.kill.soft ? ' · soft' : ''}` : '—']] : [];
       return `<section class="lp"><h4>4 · Last battle rig</h4><p class="sentence">${esc(battleSentence(lb))}</p>${lb ? `<table class="lt">${rows.map(([a, b]) => kv(a, b)).join('')}</table>` : ''}<div class="btns"><button class="ghost sm" data-act="lab-replay" ${lb ? '' : 'disabled'}>Replay fair</button><button class="ghost sm" data-act="lab-rehearse">Rehearse ×200</button><button class="ghost sm" data-act="lab-export-turns" ${lb ? '' : 'disabled'}>Export turns</button></div>${labLast.replay ? `<div class="kv res">Same opponent, fair dice: ${labLast.replay.sameOpponent.result.toUpperCase()} on turn ${labLast.replay.sameOpponent.turn} (${labLast.replay.sameOpponent.replayed} of ${labLast.replay.recorded} actions replayed). Honest-rung opponent: ${labLast.replay.honestRung.result.toUpperCase()}.</div>` : ''}${labLast.rehearse ? `<div class="kv res">Rehearsed ×${labLast.rehearse.n} (${labLast.rehearse.rig.phase}, tier ${labLast.rehearse.rig.effTier}${labLast.rehearse.sampled ? ', 8 regenerated opponents' : ''}): loss ${pct(labLast.rehearse.lossRate)} · near-miss ${pct(labLast.rehearse.nearMissRate)} · sliver ${pct(labLast.rehearse.sliverRate)} · bait ${pct(labLast.rehearse.baitRate)} · stall ${pct(labLast.rehearse.stallRate)} · mean ${labLast.rehearse.meanTurns} turns</div>` : ''}</section>`; },
-    pack: () => `<section class="lp"><h4>5 · Last pack rig</h4>${lp ? `<p class="sentence">${esc(lp.sentence)}</p><table class="lt pk"><tr><th>#</th><th>rolled</th><th>final</th><th>reason</th><th>card</th></tr>${lp.slots.map((x) => `<tr><td>${x.slot}</td><td>${x.rolledRarity}</td><td>${x.finalRarity}</td><td>${x.reason}</td>${nameCell(BYID[x.id].name)}</tr>`).join('')}</table><div class="kv">${lp.bait ? `bait: shown ${lp.bait.shown === 'Holo' ? 'Holo glint' : BYID[lp.bait.shown].name} → actual ${BYID[lp.bait.actual].name}` : 'no bait'} · pity counter ${lp.packsSincePity}/${CONST.odds.pityEvery}${lp.pity ? ' (pity pack)' : ''} · excluded ${lp.rig.excludeNeeded && lp.needed ? BYID[lp.needed].name : 'nothing'}${s.pendingPack ? ' · reveal in progress' : ''}</div>` : '<p class="muted">No pack yet.</p>'}</section>`,
+    pack: () => `<section class="lp"><h4>5 · Last pack rig</h4>${lp ? `<p class="sentence">${esc(lp.sentence)}</p><table class="lt pk"><tr><th>#</th><th>rolled</th><th>final</th><th>reason</th><th>printing</th></tr>${lp.slots.map((x) => `<tr><td>${x.slot}</td><td>${x.rolledRarity}</td><td>${x.finalRarity}</td><td>${x.reason}</td><td class="name pr" title="${esc(PBYID[x.id].name)}">${x.id}<small>${num3(PBYID[x.id].number)}</small></td></tr>`).join('')}</table>${oddsTable(lp)}<div class="kv">${lp.bait ? `bait: shown ${lp.bait.shown === 'Holo' || lp.bait.shown === 'Secret' ? lp.bait.shown + ' glint' : plab(lp.bait.shown)} → actual ${plab(lp.bait.actual)}` : 'no bait'} · pity counter ${lp.packsSincePity}/${CONST.odds.pityEvery}${lp.pity ? ' (pity pack)' : ''} · excluded ${lp.rig.excludeNeeded && lp.needed ? plab(lp.needed) : 'nothing'}${s.pendingPack ? ' · reveal in progress' : ''}</div>` : '<p class="muted">No pack yet.</p>'}</section>`,
     revenue: () => { const adsShown = LOG.entries.filter((e) => e.type === 'ad.show').length, perMin = ses.activeMs >= 60000 ? '$' + (m.revenue.total / (ses.activeMs / 60000)).toFixed(4) : '—'; return `<section class="lp"><h4>6 · Revenue (fictional)</h4><div class="kv">rewarded $${m.revenue.rewarded.toFixed(4)} · interstitial $${m.revenue.interstitial.toFixed(4)} · banner $${m.revenue.banner.toFixed(4)} · <b>total $${m.revenue.total.toFixed(4)}</b></div><div class="kv">ads shown ${adsShown} · ad seconds ${Math.round(ses.adSeconds)} · interstitials ${ses.interstitials}/${CONST.ads.interstitialsPerSession} · active ${Math.round(ses.activeMs / 1000)} s · <b>$ per minute of your attention: ${perMin}</b></div>
       <div class="kv">offers: ${Object.entries(offersBy).map(([p, v]) => `${p} ${v.accepted}/${v.shown}`).join(' · ') || 'none yet'}</div><button class="ghost sm" data-act="lab-about">About the machine →</button></section>`; },
     log: () => { const entries = LOG.entries.filter((e) => !labFilter || e.type.includes(labFilter) || JSON.stringify(e.data).includes(labFilter)).slice(-120).reverse(); return `<section class="lp"><h4>7 · Event log</h4><div class="btns"><input id="lab-filter" placeholder="filter type…" value="${esc(labFilter)}" aria-label="Filter the event log"><button class="ghost sm" data-act="lab-export-log">Export JSON lines</button><button class="ghost sm" data-act="copy-seed">Copy seed</button></div><div class="evlog">${entries.map(fmtLogLine).join('')}</div></section>`; },
@@ -1817,7 +2092,11 @@ function labRenderNow() {
   const body = $('.lab-body', els.lab); if (body) body.scrollTop = labScroll[labTab] || 0;
   if (keepId) { const el = document.getElementById(keepId); if (el) { el.focus(); if (keepVal != null && el.tagName === 'INPUT' && el.type === 'text') { el.value = keepVal; try { el.setSelectionRange(keepSel, keepSel); } catch (e) { /* ignore */ } } } }
 }
-const ABOUT_MACHINE = (m, offersBy, ses) => { const live = (p) => (offersBy[p] ? `${offersBy[p].accepted}/${offersBy[p].shown}` : '0/0'); return `<div class="memo"><p><b>Internal memo (fictional studio).</b> Placement ranking with expected acceptance, beside this player's live numbers:</p><ol><li>Revive at the moment of loss — 60% WATCHER / 25% RESISTANT · you: ${live('revive')}</li><li>Double coins after a personal best — 45% · you: ${live('double')}</li><li>Sponsor Pack after two losses — 40% · you: ${live('freepack')}</li><li>Skip the Lab Delivery timer — 30% · you: ${live('skip')}</li><li>Re-roll the duplicate — 35% · you: ${live('reroll')}</li><li>Recharge Focus — 50% · you: ${live('recharge')}</li><li>Restore streak — 55% · you: ${live('streak')}</li></ol><p>KPI targets: ARPDAU $0.11 (you: $${m.revenue.total.toFixed(4)}), 4.2 ads/DAU (you: ${LOG.entries.filter((e) => e.type === 'ad.show').length}), rewarded acceptance ≥ 55%, median session 7.5 min (you: ${(ses.activeMs / 60000).toFixed(1)} min).</p><p>Mechanics recognised as: player-value model → price discrimination; moreCleanSuccessRound → contrast effect; boost then kill → negative prediction error; bait → near-miss effect; revive at loss → negative reinforcement at peak aversion; patience estimator → adaptive staircase; segmentation → differential reinforcement; inflated post-ad rewards → reward-magnitude confound; cadence/caps → scarcity; timers → temporal discounting; FOMO countdowns → scarcity heuristic; streaks → sunk cost; collection completion → Zeigarnik/goal gradient (the rung 10–12 endgame needs Legendary teams with copies); confirmshaming → loss framing; fake/late/moving close → cost of escape; strategic pity timer → visible goal gradient for the hard-to-monetise; variable ratio → Skinner's VR schedule; illusion of control → Langer; A/B thresholds → experimentation on frustration.</p></div>`; };
+function oddsTable(lp) { // "disclosed x% · effective y%" per rarity for the phase the pack was opened in (Addendum 2 §7)
+  const n = lp.slots.length, fmt = (x) => (x <= 0 ? '0' : x < 0.1 ? x.toFixed(2) : x < 10 ? x.toFixed(1) : String(Math.round(x))), cell = (d, e) => `<td class="${Math.abs(d - e) > 0.05 ? 'diff' : ''}" title="disclosed ${fmt(d)}% · effective ${fmt(e)}%"><span>${fmt(d)}</span><b>${fmt(e)}</b></td>`;
+  return `<table class="lt odds"><caption>% per slot — disclosed (the Shop's Pull rates) over effective on the ${esc(lp.row)} row</caption><tr><th>rarity</th><th>${n === 5 ? '1–3' : '1–2'}</th>${n === 5 ? '<th>4</th>' : ''}<th>${n}</th></tr>${oddsRows(lp).map((o) => `<tr><td title="${esc(rarityName(o.r))}">${o.r}</td>${cell(o.d13, o.e13)}${n === 5 ? cell(o.d4, o.e4) : ''}${cell(o.d4, o.e5)}</tr>`).join('')}</table>`;
+}
+const ABOUT_MACHINE = (m, offersBy, ses) => { const live = (p) => (offersBy[p] ? `${offersBy[p].accepted}/${offersBy[p].shown}` : '0/0'); return `<div class="memo"><p><b>Internal memo (fictional studio).</b> Placement ranking with expected acceptance, beside this player's live numbers:</p><ol start="0"><li>Mythic #151 in post-ad packs (1% of REWARD slot 5) — the secret only drops for watchers · you: ${LOG.entries.filter((e) => e.type === 'pack.open' && e.data.row === 'REWARD').length} post-ad pack(s), ${LOG.entries.filter((e) => e.type === 'pack.rig' && e.data.reason === 'mythic-reward').length} Mythic</li><li>Revive at the moment of loss — 60% WATCHER / 25% RESISTANT · you: ${live('revive')}</li><li>Double coins after a personal best — 45% · you: ${live('double')}</li><li>Sponsor Pack after two losses — 40% · you: ${live('freepack')}</li><li>Skip the Lab Delivery timer — 30% · you: ${live('skip')}</li><li>Re-roll the duplicate — 35% · you: ${live('reroll')}</li><li>Recharge Focus — 50% · you: ${live('recharge')}</li><li>Restore streak — 55% · you: ${live('streak')}</li></ol><p>KPI targets: ARPDAU $0.11 (you: $${m.revenue.total.toFixed(4)}), 4.2 ads/DAU (you: ${LOG.entries.filter((e) => e.type === 'ad.show').length}), rewarded acceptance ≥ 55%, median session 7.5 min (you: ${(ses.activeMs / 60000).toFixed(1)} min).</p><p>Mechanics recognised as: player-value model → price discrimination; moreCleanSuccessRound → contrast effect; boost then kill → negative prediction error; bait → near-miss effect; revive at loss → negative reinforcement at peak aversion; patience estimator → adaptive staircase; segmentation → differential reinforcement; inflated post-ad rewards → reward-magnitude confound; cadence/caps → scarcity; timers → temporal discounting; FOMO countdowns → scarcity heuristic; streaks → sunk cost; collection completion → Zeigarnik/goal gradient (the rung 10–12 endgame needs Legendary teams with copies); confirmshaming → loss framing; fake/late/moving close → cost of escape; strategic pity timer → visible goal gradient for the hard-to-monetise; variable ratio → Skinner's VR schedule; illusion of control → Langer; A/B thresholds → experimentation on frustration.</p></div>`; };
 function labToggle(open, silent) {
   const want = open == null ? !labOpen : !!open; if (want === labOpen) { labRender(); return labOpen; }
   labOpen = want; prefs.lab = labOpen; persist(); els.lab.classList.toggle('open', labOpen); els.app.classList.toggle('lab-open', labOpen);
@@ -1875,7 +2154,7 @@ function finishOnboarding() {
 /* ============================================================ 16. Debug / test API (§10, A-10) — always attached, harmless in normal play */
 const PHASES = ['ONBOARD', 'CLEAN', 'NORMAL', 'KILL', 'OFFER', 'REWARD', 'COOLDOWN'];
 function getState() {
-  const s = deepClone(save), team = (save.team || []).map((id) => { const c = BYID[id], copies = save.collection[id] || 1; return { id, name: c.name, rarity: c.rarity, sys: c.sys, copies, power: cardPower(c, copies), ltp: potentiation(copies) }; });
+  const s = deepClone(save), team = (save.team || []).filter((id) => PBYID[id]).map((id) => { const c = creatureOf(id), l = ltpOf(id); return { id, base: c.id, name: c.name, rarity: c.rarity, printing: PBYID[id].rarity, sys: c.sys, copies: l.copies, units: l.units, power: powerOf(id), ltp: l.pot }; }); // id = printing; the rest is the creature's
   const rv = RIVALS[clamp(save.ladder.nextRung, 1, 12) - 1];
   return Object.assign(s, { team, teamIds: save.team.slice(), power: sum(team.map((t) => t.power)), powerTier: team.length ? powerTier(currentTeamCards()) : null, nextRival: { rung: rv.rung, name: rv.name, league: rv.league, specialty: rv.specialty }, focusNextMs: focusNextMs(), onboardingStep: save.onboarding.step });
 }
@@ -1890,7 +2169,10 @@ function resetAll(newSeed) {
 }
 const GAME = {
   version: CONST.version, CONST, TIER_POWER: CONST.TIER_POWER, cards: CARDS, rivals: RIVALS,
-  engine: { expectedDamage, score, aiChoose, aiReplace, bestMove, makeMon, tierMult, potentiationOf: potentiation, cardPower, rarityWeights, genOpponent: (o) => GAME.genOpponent(o) }, // pure functions; aiChoose/aiReplace accept the getBattle() view (A-3.7.4)
+  engine: { expectedDamage, score, aiChoose, aiReplace, bestMove, makeMon, tierMult, typeMult, potentiationOf: potentiation, potentiationUnits, cardPower, rarityWeights, genOpponent: (o) => GAME.genOpponent(o) }, // pure functions; aiChoose/aiReplace accept the getBattle() view (A-3.7.4)
+  printings: () => PRINTINGS.map((p) => Object.assign({}, p)), cardOf: (id) => creatureOf(id), isVariant: (id) => isVariantP(PBYID[id]), // Addendum 2 §9: the 176 printings; a printing id → its creature
+  ltp: (id, coll) => ltpOf(id, coll), powerOf: (id, coll) => powerOf(id, coll), // creature-level copies / LTP units / potentiation / power for any printing id (optionally against a scratch collection)
+  binderRows: (coll) => binder.allRows(coll).map((r) => ({ row: r.row, owned: r.owned, total: r.total, missing: r.missing.slice() })), teamError: (ids) => teamError(ids),
   art: { renderCard, renderSprite, renderGlyph, renderPortrait, renderPoster }, rngCursors: () => ({ battle: rng.battle.calls, pack: rng.pack.calls, ui: rng.ui.calls }),
   seed(n) { n = n >>> 0; save.seed = n; seedStreams(n); if (!model.experiments.pinned) model.experiments = deriveExperiments(n); logEvent('lab.override', { what: 'seed', value: n }); persist(); return n; },
   reset() { resetAll(); return true; },
@@ -1915,11 +2197,11 @@ const GAME = {
   },
   setSegment(s) { if (!['UNKNOWN', 'WATCHER', 'RESISTANT'].includes(s)) return false; logEvent('lab.override', { what: 'segment', value: s }); if (s !== model.segment) logEvent('segment.change', { from: model.segment, to: s, lab: true }); model.segment = s; scheduleFocus(); persist(); ui.refreshHome(); return s; },
   setExperiment(partial) { Object.assign(model.experiments, partial || {}); model.experiments.pinned = true; if (partial && partial.T0 != null && save.battlesPlayed === 0) model.T = partial.T0; logEvent('lab.override', { what: 'experiments', value: partial }); persist(); return deepClone(model.experiments); },
-  giveCards(x) { const add = Array.isArray(x) ? Object.fromEntries(x.map((id) => [id, 1])) : x || {}; for (const id in add) if (BYID[id]) save.collection[id] = (save.collection[id] || 0) + (add[id] | 0 || 1); logEvent('lab.override', { what: 'giveCards', value: add }); binder.checkNearComplete(); persist(); ui.refreshHome(); return deepClone(save.collection); },
+  giveCards(x) { const add = Array.isArray(x) ? Object.fromEntries(x.map((id) => [id, 1])) : x || {}; for (const id in add) if (PBYID[id]) save.collection[id] = (save.collection[id] || 0) + (add[id] | 0 || 1); logEvent('lab.override', { what: 'giveCards', value: add }); binder.checkNearComplete(); persist(); ui.refreshHome(); return deepClone(save.collection); },
   give(o) { o = o || {}; if (o.coins != null) save.coins += o.coins; if (o.focus != null) { save.focus = clamp(save.focus + o.focus, 0, CONST.focus.max); scheduleFocus(); } logEvent('lab.override', { what: 'give', value: o }); persist(); ui.refreshHome(); return { coins: save.coins, focus: save.focus }; },
   setTeam(ids) { const ok = setTeam(ids); if (ok) logEvent('lab.override', { what: 'team', value: ids }); ui.refreshHome(); return ok; },
   openPack(opts) {
-    opts = opts || {}; const r = packs.open(opts.type || 'standard', { free: !!opts.free }); if (r.error) return r;
+    opts = opts || {}; const r = packs.open(opts.type || 'standard', { free: !!opts.free, force: opts.force }); if (r.error) return r; // force: printing ids per slot (null keeps the draw), logged lab.override{what:'packSlots'}
     if (opts.instant || settings.skipAnims || !hasDOM) { packs.apply(r); ui.packSummary(r, true); } else ui.packReveal(r);
     return { cards: r.cards.map((c) => c.id), slots: r.slots, rig: r.rig, bait: r.bait, badges: r.badges, pity: r.pity, rarePlus: r.rarePlus, newCount: r.newCount, sentence: r.sentence };
   },
@@ -1936,8 +2218,8 @@ const GAME = {
   lab(b) { return ui.labToggle(b); },
   goto(screen) { ui.go(screen); return screen; },
   rigProfile: () => nextRigProfile(), packProfile: () => packProfileFor('standard'), fairRig: (rung) => fairRig(rung || save.ladder.nextRung),
-  powerTier: (ids) => powerTier((ids || save.team).map((id) => BYID[id])),
-  genOpponent(o) { o = o || {}; return genOpponent({ rung: o.rung || 1, effTier: o.effTier != null ? o.effTier : o.rung || 1, seed: o.seed != null ? o.seed : save.seed, battlesPlayed: o.battlesPlayed != null ? o.battlesPlayed : save.battlesPlayed, candidate: o.candidate || 0, playerTeam: (o.player || save.team).map((id) => BYID[id]), counterPick: !!o.counterPick, count: o.count || 3 }).map((c) => c.id); },
+  powerTier: (ids) => powerTier((ids || save.team).map(creatureOf).filter(Boolean)),
+  genOpponent(o) { o = o || {}; return genOpponent({ rung: o.rung || 1, effTier: o.effTier != null ? o.effTier : o.rung || 1, seed: o.seed != null ? o.seed : save.seed, battlesPlayed: o.battlesPlayed != null ? o.battlesPlayed : save.battlesPlayed, candidate: o.candidate || 0, playerTeam: (o.player || save.team).map(creatureOf).filter(Boolean), counterPick: !!o.counterPick, count: o.count || 3 }).map((c) => c.id); },
   simulatePacks: (n, o) => packs.simulate(n, o), simulateInterstitials: (n) => ads.simulateInterstitials(n),
   pendingOffer: () => (offers.pending ? { placement: offers.pending.placement, special: offers.pending.special, pill: offers.pending.pill } : null),
   currentAd: () => (ads.current ? { format: ads.current.format, advertiser: ads.current.advertiser.key, placement: ads.current.placement, trueX: ads.current.trueX, decoy: ads.current.decoy, landing: ads.current.landing } : null),
@@ -1954,6 +2236,7 @@ function boot() {
   if (bad || !parsed.save || !parsed.model) { if (bad) upgraded = true; resetAll(); }
   else {
     save = Object.assign(freshSave(parsed.save.seed, now), parsed.save); model = Object.assign(freshModel(parsed.save.seed, now), parsed.model);
+    if (parsed.save.setRev !== SET_REV) { save.nearFlagged = {}; save.setRev = SET_REV; } // a v1 save from the 60-card set: collection and team ids are still valid printing ids; only the row flags (11/12 rows) are stale
     if (parsed.log) { LOG.seq = parsed.log.seq || 0; LOG.entries = parsed.log.entries || []; } if (parsed.prefs) prefs = Object.assign(prefs, parsed.prefs);
     seedStreams(save.seed, save.rng);
     if (!model.inputs.pinned) model.inputs = readInputs();
